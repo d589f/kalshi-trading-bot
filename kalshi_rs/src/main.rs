@@ -14,6 +14,7 @@ mod dashboard;
 mod engine;
 mod kalshi;
 mod ledger;
+mod mirror;
 mod signal;
 mod state;
 mod window;
@@ -123,6 +124,16 @@ struct LiveCfg {
     price_buf: f64,
 }
 
+/// MIRROR config (env). When `url` is set, the f6 signal is taken straight from the
+/// prod paper engine (window_open / Δ / σ / book) instead of our own Binance feed,
+/// making the side + entry 1:1 with the paper. `max_age_secs` guards a stale/dead paper:
+/// if the paper's last_update is older than this, we SKIP the tick (never trade blind).
+#[derive(Clone)]
+struct MirrorCfg {
+    url: Option<String>,
+    max_age_secs: f64,
+}
+
 const LIVE_STATE_PATH: &str = "live_state.json";
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -180,6 +191,15 @@ async fn main() -> Result<()> {
         max_count: env_i64("MAX_COUNT", 15),
         price_buf: env_f64("PRICE_BUF", 0.02),
     };
+    // MIRROR: take the signal from the paper engine (1:1). Off unless MIRROR_STATE_URL set.
+    let mcfg = MirrorCfg {
+        url: std::env::var("MIRROR_STATE_URL").ok().filter(|s| !s.is_empty()),
+        max_age_secs: env_f64("MIRROR_MAX_AGE_SECS", 5.0),
+    };
+    if let Some(u) = &mcfg.url {
+        info!("MIRROR mode ON — signal sourced from paper engine {u} (max_age={}s)", mcfg.max_age_secs);
+    }
+    let http = reqwest::Client::new();
     let live_state = Arc::new(Mutex::new(load_live_state()));
     let order_client: Option<Arc<OrderClient>> =
         match (std::env::var("KALSHI_KEY_ID"), std::env::var("KALSHI_KEY_PATH")) {
@@ -302,7 +322,7 @@ async fn main() -> Result<()> {
     }
 
     // 4) Signal loop @ 0.3s
-    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state).await;
+    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http).await;
     Ok(())
 }
 
@@ -476,6 +496,8 @@ async fn signal_loop(
     order_client: Option<Arc<OrderClient>>,
     lcfg: LiveCfg,
     live_state: Arc<Mutex<LiveState>>,
+    mcfg: MirrorCfg,
+    http: reqwest::Client,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     let mut fired_window: Option<String> = None;
@@ -513,14 +535,67 @@ async fn signal_loop(
             info!("window roll → {:?}..{:?}", win.window_start, win.window_end);
         }
 
-        let price = match price_opt {
-            Some(p) => p,
-            None => continue, // no BTC yet
-        };
-
-        // ---- compute signal inputs ----
-        let sigmas = compute_all_sigmas(&history, now);
+        // ---- signal inputs: our own feed by default, or the paper's exact state (MIRROR) ----
         let (ofi_1, _ofi_3, _ofi_5, buy_v, sell_v, _cnt) = compute_ofi(&buffer, now);
+        let mut sigmas = compute_all_sigmas(&history, now);
+
+        // defaults from our own Binance feed + local window/book
+        let mut win = win;
+        let mut book = kalshi.clone().unwrap_or_default();
+        let mut price = price_opt.unwrap_or(0.0);
+        let mut delta_open = price_opt.and_then(|p| win.delta_from_open(p));
+        let mut delta_prev = price_opt.and_then(|p| win.delta_from_prev(p));
+        let mut last_trade_exp: Option<f64> = None;
+
+        if let Some(murl) = mcfg.url.as_deref() {
+            // MIRROR: window_open / Δ / σ / book come straight from the paper engine,
+            // so our (validated) f6 filter produces the SAME side + entry as the paper.
+            match mirror::fetch(&http, murl, now_utc).await {
+                Some(m) if m.age_secs <= mcfg.max_age_secs => {
+                    win = window::WindowState {
+                        window_start: Some(m.window_start),
+                        window_end: Some(m.window_end),
+                        window_open_price: Some(m.window_open),
+                        prev_close_price: Some(m.binance_price - m.delta_from_prev),
+                    };
+                    price = m.binance_price;
+                    sigmas.insert("max30".to_string(), m.sigma_max30);
+                    delta_open = Some(m.delta_from_open);
+                    delta_prev = Some(m.delta_from_prev);
+                    last_trade_exp = m.last_trade_expensive;
+                    book = KalshiBook {
+                        ticker: m.ticker,
+                        yes_bid: m.yes_bid,
+                        yes_bid_vol: m.yes_bid_vol,
+                        yes_ask: m.yes_ask,
+                        yes_ask_vol: m.yes_ask_vol,
+                        no_bid: m.no_bid,
+                        no_bid_vol: m.no_bid_vol,
+                        no_ask: m.no_ask,
+                        no_ask_vol: m.no_ask_vol,
+                        last_price: None,
+                        floor_strike: None,
+                        ts: now,
+                    };
+                }
+                other => {
+                    // paper stale or unreachable → skip; never trade on a blind signal
+                    if now - last_status_log > 10.0 {
+                        last_status_log = now;
+                        warn!(
+                            "[{}] MIRROR {} — skipping tick (no blind trades)",
+                            SESSION_NAME,
+                            if other.is_some() { "STALE" } else { "UNREACHABLE" }
+                        );
+                    }
+                    dash.lock().unwrap().live.reason = "MIRROR WAIT".to_string();
+                    continue;
+                }
+            }
+        } else if price_opt.is_none() {
+            continue; // own-feed mode needs a BTC price
+        }
+
         let tau = win.tau(now_utc);
         let elapsed = win.elapsed_min(now_utc);
         let hour = win
@@ -528,11 +603,10 @@ async fn signal_loop(
             .map(|w| w.format("%H").to_string().parse::<i32>().unwrap_or(0))
             .unwrap_or(0);
 
-        let book = kalshi.clone().unwrap_or_default();
         let shared = Shared {
             binance_price: Some(price),
-            delta_from_open: win.delta_from_open(price),
-            delta_from_prev: win.delta_from_prev(price),
+            delta_from_open: delta_open,
+            delta_from_prev: delta_prev,
             tau,
             elapsed_min: elapsed,
             sigma: sigmas.get("realized5_pmin").copied(),
@@ -549,7 +623,7 @@ async fn signal_loop(
             no_ask: book.no_ask,
             no_ask_vol: book.no_ask_vol,
             no_bid_vol: book.no_bid_vol,
-            last_trade_expensive: None, // Kalshi: no last-trade-expensive proxy yet (REST book only)
+            last_trade_expensive: last_trade_exp,
         };
 
         let res = evaluate(&cfg, &shared);
