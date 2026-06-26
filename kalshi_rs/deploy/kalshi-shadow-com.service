@@ -1,0 +1,23 @@
+[Unit]
+Description=Kalshi f6 shadow — binance.com feed (EU), pushes triggers to Buffalo dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dmitrii
+WorkingDirectory=/home/dmitrii/kalshi_rs
+Environment=RUST_LOG=info
+# EU box can reach binance.com (same feed the paper uses)
+Environment=BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@aggTrade
+Environment=KALSHI_BASE=https://api.elections.kalshi.com/trade-api/v2
+Environment=DASH_PORT=8899
+Environment=DASH_TOKEN=CHANGEME_shared_secret
+# push our triggers to the Buffalo dashboard's COM column
+Environment=PUSH_TRIGGERS_URL=http://23.95.217.78:8890/shadow_com
+ExecStart=/home/dmitrii/kalshi_rs/target/release/kalshi_bot
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

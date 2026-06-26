@@ -1,0 +1,4 @@
+# Re-downloadable Binance 1m data (data.binance.vision) — not committed (26MB of zips)
+cache/
+__pycache__/
+*.pyc

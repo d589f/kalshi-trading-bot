@@ -1,0 +1,45 @@
+[package]
+name = "kalshi_bot"
+version = "0.1.0"
+edition = "2021"
+description = "Kalshi KXBTC15M `third` (f6_wait270) live shadow runner — Rust port of the dash_src paper engine"
+
+[[bin]]
+name = "kalshi_bot"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# websockets (rustls — no OpenSSL link needed)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# http client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# json / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# math: erf for the standard-normal CDF, matched to Python's math.erf (libm)
+libm = "0.2"
+
+# time (UTC, ISO-8601) — matches the engine's _now_utc()
+chrono = { version = "0.4", features = ["serde"] }
+
+# Kalshi request signing: RSA-PSS + SHA-256, base64
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+# config + logging + errors
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

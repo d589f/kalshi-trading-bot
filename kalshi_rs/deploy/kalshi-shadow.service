@@ -1,0 +1,23 @@
+[Unit]
+Description=Kalshi KXBTC15M f6_wait270 shadow runner (paper-vs-live trigger logger)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/kalshi_rs
+Environment=RUST_LOG=info
+# US server: binance.com is geo-blocked (451), so use Binance.US:
+Environment=BINANCE_WS_URL=wss://stream.binance.us:9443/ws/btcusdt@aggTrade
+Environment=DASH_PORT=8890
+# shared secret required on POST /paper (prod cron sends X-Token):
+Environment=DASH_TOKEN=CHANGEME_shared_secret
+ExecStart=/root/kalshi_rs/target/release/kalshi_bot
+Restart=always
+RestartSec=3
+# keep the JSONL ledger + journald logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

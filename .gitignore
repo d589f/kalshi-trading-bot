@@ -1,0 +1,30 @@
+# --- NOT part of the Kalshi trading bot ---
+pascal_research/
+
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+
+# Rust build artifacts
+**/target/
+
+# Python
+**/__pycache__/
+*.pyc
+
+# Re-downloadable Binance 1m data (data.binance.vision)
+**/cache/
+
+# Runtime data / state (never commit)
+*.jsonl
+**/.cutoff
+*.db
+*.sqlite
+
+# Secrets — never commit
+*.pem
+*.key
+gcp_key*
+.env
+.env_*
+*secret*
