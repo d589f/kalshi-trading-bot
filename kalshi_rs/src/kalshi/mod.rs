@@ -1,6 +1,7 @@
 //! Kalshi venue: REST client, request signing, and the derived top-of-book.
 
 pub mod auth;
+pub mod orders;
 pub mod rest;
 
 use rest::{Level, Market, RawBook};

@@ -29,11 +29,20 @@ use tracing_subscriber::EnvFilter;
 use config::{SessionConfig, STATE_TICK_SECS};
 use dashboard::{Dash, TrigSummary};
 use engine::{evaluate, Shared, Side};
+use kalshi::auth::Signer;
+use kalshi::orders::OrderClient;
 use kalshi::rest::{KalshiRest, PROD_BASE, SERIES_KXBTC15M};
 use kalshi::{kalshi_fee_usd, pick_market_for_close, KalshiBook};
 use ledger::{Ledger, ResolveRecord, TriggerRecord};
 use signal::{compute_all_sigmas, compute_ofi, p_model_classic};
 use state::AppState;
+
+fn env_f64(k: &str, d: f64) -> f64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+fn env_i64(k: &str, d: i64) -> i64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
 
 const SESSION_NAME: &str = "f6_wait270_shadow";
 const LEDGER_PATH: &str = "shadow_ledger.jsonl";
@@ -91,7 +100,7 @@ fn load_ledger_into_dash(path: &str, dash: &Arc<Mutex<Dash>>) {
     info!("loaded {} shadow triggers from ledger", d.triggers.len());
 }
 
-/// A fired would-be order awaiting Kalshi settlement.
+/// A fired order awaiting Kalshi settlement (shadow would-be, or a real live fill).
 #[derive(Clone)]
 struct Pending {
     ticker: String,
@@ -100,6 +109,40 @@ struct Pending {
     count: f64,
     stake: f64,
     window_end: DateTime<Utc>,
+    live: bool, // true = real money trade (resolver updates daily PnL)
+}
+
+/// Live-trading config (env). Disabled by default — shadow stays log-only unless LIVE_TRADING=1.
+#[derive(Clone)]
+struct LiveCfg {
+    enabled: bool,
+    stake: f64,
+    max_trades_day: i64,
+    daily_loss_stop: f64,
+    max_count: i64,
+    price_buf: f64,
+}
+
+const LIVE_STATE_PATH: &str = "live_state.json";
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct LiveState {
+    day: String,
+    trades_today: i64,
+    day_pnl: f64,
+}
+
+fn load_live_state() -> LiveState {
+    std::fs::read_to_string(LIVE_STATE_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_live_state(s: &LiveState) {
+    if let Ok(j) = serde_json::to_string(s) {
+        let _ = std::fs::write(LIVE_STATE_PATH, j);
+    }
 }
 
 #[tokio::main]
@@ -126,7 +169,52 @@ async fn main() -> Result<()> {
     let state = Arc::new(Mutex::new(AppState::new()));
     let ledger = Arc::new(Ledger::new(LEDGER_PATH));
     let pending: Arc<Mutex<Vec<Pending>>> = Arc::new(Mutex::new(Vec::new()));
-    let rest = Arc::new(KalshiRest::new(base)?);
+    let rest = Arc::new(KalshiRest::new(base.clone())?);
+
+    // ---- live trading setup (REAL orders; OFF unless LIVE_TRADING=1) ----
+    let lcfg = LiveCfg {
+        enabled: std::env::var("LIVE_TRADING").map(|v| v == "1").unwrap_or(false),
+        stake: env_f64("STAKE", 5.0),
+        max_trades_day: env_i64("MAX_TRADES_DAY", 20),
+        daily_loss_stop: env_f64("DAILY_LOSS_STOP", 30.0),
+        max_count: env_i64("MAX_COUNT", 15),
+        price_buf: env_f64("PRICE_BUF", 0.02),
+    };
+    let live_state = Arc::new(Mutex::new(load_live_state()));
+    let order_client: Option<Arc<OrderClient>> =
+        match (std::env::var("KALSHI_KEY_ID"), std::env::var("KALSHI_KEY_PATH")) {
+            (Ok(kid), Ok(kpath)) => match std::fs::read_to_string(&kpath) {
+                Ok(pem) => match Signer::from_pem(kid, &pem).and_then(|s| OrderClient::new(base.clone(), s)) {
+                    Ok(oc) => {
+                        info!(
+                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${}",
+                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop
+                        );
+                        Some(Arc::new(oc))
+                    }
+                    Err(e) => {
+                        warn!("order client init failed: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("key file read failed: {e}");
+                    None
+                }
+            },
+            _ => {
+                if lcfg.enabled {
+                    warn!("LIVE_TRADING=1 but KALSHI_KEY_ID/KALSHI_KEY_PATH unset — staying shadow");
+                }
+                None
+            }
+        };
+    // optional $0 self-test of the Rust order path (1c bid + 99c ask IOC, no fill)
+    if std::env::var("SELF_TEST_ORDER").ok().as_deref() == Some("1") {
+        if let Some(oc) = &order_client {
+            self_test_orders(oc, &rest).await;
+        }
+    }
 
     // Persistent comparison cutoff: survives restarts (so deploys don't wipe the dashboard
     // history). Stored in `.cutoff` in the working dir; first run stamps now.
@@ -144,7 +232,11 @@ async fn main() -> Result<()> {
         d.started_iso = cutoff;
         d.live.binance_feed = std::env::var("BINANCE_WS_URL")
             .unwrap_or_else(|_| "binance.us (default)".to_string());
-        d.live.order_mode = std::env::var("ORDER_MODE").unwrap_or_else(|_| "log-only (shadow)".to_string());
+        d.live.order_mode = if lcfg.enabled {
+            format!("LIVE ${} (real orders)", lcfg.stake)
+        } else {
+            "log-only (shadow)".to_string()
+        };
     }
     load_ledger_into_dash(LEDGER_PATH, &dash);
     let dash_port: u16 = std::env::var("DASH_PORT")
@@ -205,12 +297,55 @@ async fn main() -> Result<()> {
         let pend = pending.clone();
         let led = ledger.clone();
         let dsh = dash.clone();
-        tokio::spawn(async move { resolver(rc, pend, led, dsh).await });
+        let ls = live_state.clone();
+        tokio::spawn(async move { resolver(rc, pend, led, dsh, ls).await });
     }
 
     // 4) Signal loop @ 0.3s
-    signal_loop(state, ledger, pending, cfg, dash).await;
+    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state).await;
     Ok(())
+}
+
+/// $0 self-test of the order path: a 1c bid (buy YES) and a 99c ask (sell YES) IOC on the
+/// current mid-market — both must be accepted (201) with 0 fill, proving signing + V2 schema.
+async fn self_test_orders(oc: &OrderClient, rest: &KalshiRest) {
+    info!("SELF_TEST: probing order path ($0, no fill)...");
+    let markets = match rest.get_markets(SERIES_KXBTC15M, "open").await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("self-test discovery failed: {e}");
+            return;
+        }
+    };
+    let Some(m) = markets.first() else {
+        warn!("self-test: no open market");
+        return;
+    };
+    let raw = match rest.get_orderbook(&m.ticker, 5).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("self-test orderbook: {e}");
+            return;
+        }
+    };
+    let book = KalshiBook::derive(&m.ticker, &raw, None, now_secs());
+    let byb = book.yes_bid.unwrap_or(0.0);
+    let bnb = book.no_bid.unwrap_or(0.0);
+    if bnb < 0.99 {
+        match oc.create_ioc(&m.ticker, "bid", 1.0, 0.01, format!("selftest-bid-{}", now_secs() as i64)).await {
+            Ok((s, r, lat)) => info!("SELF_TEST bid@$0.01 -> HTTP {} fill={} ({}ms)", s, r.fill_count, lat),
+            Err(e) => warn!("self-test bid err: {e}"),
+        }
+    }
+    if byb < 0.99 {
+        match oc.create_ioc(&m.ticker, "ask", 1.0, 0.99, format!("selftest-ask-{}", now_secs() as i64)).await {
+            Ok((s, r, lat)) => info!("SELF_TEST ask@$0.99 -> HTTP {} fill={} ({}ms)", s, r.fill_count, lat),
+            Err(e) => warn!("self-test ask err: {e}"),
+        }
+    }
+    if let Ok(b) = oc.balance_dollars().await {
+        info!("SELF_TEST balance ${:.2} (should be unchanged)", b);
+    }
 }
 
 /// Poll the current window's KXBTC15M orderbook into `state.kalshi`.
@@ -263,6 +398,7 @@ async fn resolver(
     pending: Arc<Mutex<Vec<Pending>>>,
     ledger: Arc<Ledger>,
     dash: Arc<Mutex<Dash>>,
+    live_state: Arc<Mutex<LiveState>>,
 ) {
     loop {
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -296,10 +432,20 @@ async fn resolver(
                             won,
                             pnl_usd: (pnl * 100.0).round() / 100.0,
                         });
-                        info!(
-                            "RESOLVED {} {} result={} won={} pnl=${:+.2}",
-                            pd.ticker, pd.side, m.result, won, pnl
-                        );
+                        if pd.live {
+                            let mut s = live_state.lock().unwrap();
+                            s.day_pnl = ((s.day_pnl + pnl) * 100.0).round() / 100.0;
+                            save_live_state(&s);
+                            info!(
+                                "🟢 LIVE RESOLVED {} {} result={} won={} pnl=${:+.2} (day_pnl=${:+.2})",
+                                pd.ticker, pd.side, m.result, won, pnl, s.day_pnl
+                            );
+                        } else {
+                            info!(
+                                "RESOLVED {} {} result={} won={} pnl=${:+.2}",
+                                pd.ticker, pd.side, m.result, won, pnl
+                            );
+                        }
                         dash.lock().unwrap().resolve(
                             &pd.ticker,
                             pd.side,
@@ -320,12 +466,16 @@ async fn resolver(
 }
 
 /// The 0.3s decision loop — the analogue of `state_updater` → `check_all_sessions`.
+#[allow(clippy::too_many_arguments)]
 async fn signal_loop(
     state: Arc<Mutex<AppState>>,
     ledger: Arc<Ledger>,
     pending: Arc<Mutex<Vec<Pending>>>,
     cfg: SessionConfig,
     dash: Arc<Mutex<Dash>>,
+    order_client: Option<Arc<OrderClient>>,
+    lcfg: LiveCfg,
+    live_state: Arc<Mutex<LiveState>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     let mut fired_window: Option<String> = None;
@@ -471,6 +621,24 @@ async fn signal_loop(
             if !already {
                 if book.ticker.is_empty() {
                     // no market yet — don't latch; wait for the poller
+                } else if lcfg.enabled && order_client.is_some() {
+                    fired_window = win_key.clone();
+                    place_live(
+                        order_client.as_ref().unwrap(),
+                        &lcfg,
+                        &live_state,
+                        &ledger,
+                        &pending,
+                        &dash,
+                        &cfg,
+                        &shared,
+                        &book,
+                        &win,
+                        &fire,
+                        now,
+                        now_utc,
+                    )
+                    .await;
                 } else {
                     fired_window = win_key.clone();
                     emit_trigger(&ledger, &pending, &cfg, &shared, &book, &win, &fire, now, now_utc, &dash);
@@ -557,6 +725,7 @@ fn emit_trigger(
             count,
             stake: cfg.stake,
             window_end: w_end_dt,
+            live: false,
         });
     }
 
@@ -574,4 +743,131 @@ fn emit_trigger(
         won: None,
         pnl: None,
     });
+}
+
+/// LIVE: place a real $STAKE IOC order for the fired trigger, record the real fill.
+/// Safety: daily caps + loss-stop, price band (0.50, max_entry], count cap, never rests.
+#[allow(clippy::too_many_arguments)]
+async fn place_live(
+    oc: &OrderClient,
+    lcfg: &LiveCfg,
+    live_state: &Arc<Mutex<LiveState>>,
+    ledger: &Ledger,
+    pending: &Arc<Mutex<Vec<Pending>>>,
+    dash: &Arc<Mutex<Dash>>,
+    cfg: &SessionConfig,
+    shared: &Shared,
+    book: &KalshiBook,
+    win: &window::WindowState,
+    fire: &engine::Fire,
+    now: f64,
+    now_utc: DateTime<Utc>,
+) {
+    // daily reset + caps
+    {
+        let mut s = live_state.lock().unwrap();
+        let today = now_utc.format("%Y-%m-%d").to_string();
+        if s.day != today {
+            *s = LiveState { day: today, trades_today: 0, day_pnl: 0.0 };
+            save_live_state(&s);
+        }
+        if s.trades_today >= lcfg.max_trades_day {
+            warn!("LIVE HALT: max {} trades/day reached", lcfg.max_trades_day);
+            return;
+        }
+        if s.day_pnl <= -lcfg.daily_loss_stop {
+            warn!("LIVE HALT: daily loss stop (${:+.2} <= -${})", s.day_pnl, lcfg.daily_loss_stop);
+            return;
+        }
+    }
+    let entry = fire.entry;
+    if !(0.50 < entry && entry <= cfg.max_entry_price) {
+        warn!("LIVE SKIP: entry {:.2} out of (0.50, {:.2}]", entry, cfg.max_entry_price);
+        return;
+    }
+    let side_str: &'static str = match fire.side {
+        Side::Yes => "yes",
+        Side::No => "no",
+    };
+    let (v2side, price) = match fire.side {
+        Side::Yes => ("bid", (entry + lcfg.price_buf).min(0.99)),
+        Side::No => ("ask", ((1.0 - entry) - lcfg.price_buf).max(0.01)),
+    };
+    let mut count = (lcfg.stake / entry).round();
+    if count < 1.0 {
+        count = 1.0;
+    }
+    if count > lcfg.max_count as f64 {
+        count = lcfg.max_count as f64;
+    }
+    let coid = format!("f6-{}-{}", now_utc.timestamp_millis(), side_str);
+    let (status, resp, lat) = match oc.create_ioc(&book.ticker, v2side, count, price, coid).await {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("LIVE order error: {e}");
+            return;
+        }
+    };
+    if status != 201 {
+        warn!("LIVE order rejected HTTP {}", status);
+        return;
+    }
+    let fill = resp.fill();
+    if fill <= 0.0 {
+        info!(
+            "LIVE NO-FILL {} {} {}x @ limit {:.2} (rem {})",
+            book.ticker, side_str.to_uppercase(), count, price, resp.remaining_count
+        );
+        return; // nothing filled -> no position
+    }
+    // effective per-contract entry of the side actually bought
+    let eff = match fire.side {
+        Side::Yes => resp.avg_price().unwrap_or(entry),
+        Side::No => 1.0 - resp.avg_price().unwrap_or(1.0 - entry),
+    };
+    let eff = (eff * 10000.0).round() / 10000.0;
+    let fee = resp.fee();
+    {
+        let mut s = live_state.lock().unwrap();
+        s.trades_today += 1;
+        save_live_state(&s);
+    }
+    let w_start = win.window_start.map(|w| w.to_rfc3339()).unwrap_or_default();
+    let w_end = win.window_end.map(|w| w.to_rfc3339()).unwrap_or_default();
+    ledger.append(&serde_json::json!({
+        "kind": "trigger", "live": true, "ts": now, "ts_iso": now_utc.to_rfc3339(),
+        "session": SESSION_NAME, "window_start": w_start.clone(), "window_end": w_end.clone(),
+        "market_ticker": book.ticker.clone(), "side": side_str, "entry": eff, "count": fill as i64,
+        "delta_from_open": shared.delta_from_open.unwrap_or(0.0), "p": fire.p,
+        "order_id": resp.order_id, "fee": fee, "latency_ms": lat as i64,
+    }));
+    dash.lock().unwrap().triggers.push(TrigSummary {
+        ts_iso: now_utc.to_rfc3339(),
+        window_start: w_start,
+        window_end: w_end,
+        ticker: book.ticker.clone(),
+        side: side_str.to_string(),
+        entry: eff,
+        count: fill as i64,
+        delta: shared.delta_from_open.unwrap_or(0.0),
+        p: fire.p,
+        result: None,
+        won: None,
+        pnl: None,
+    });
+    if let Some(we) = win.window_end {
+        pending.lock().unwrap().push(Pending {
+            ticker: book.ticker.clone(),
+            side: side_str,
+            entry: eff,
+            count: fill,
+            stake: lcfg.stake,
+            window_end: we,
+            live: true,
+        });
+    }
+    info!(
+        "🟢 LIVE FILLED {} {} {}x @ {:.3} (lat {}ms, fee ${:.3})",
+        book.ticker, side_str.to_uppercase(), fill, eff, lat, fee
+    );
 }

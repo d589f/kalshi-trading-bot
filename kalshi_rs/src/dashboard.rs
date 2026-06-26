@@ -429,18 +429,18 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  .reason{font-size:15px;font-weight:600} button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 12px;cursor:pointer}
  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px;animation:p 1.5s infinite}@keyframes p{50%{opacity:.3}}
 </style></head><body>
-<h1><span class=dot></span>Kalshi f6_wait270 — feed comparison vs paper</h1>
+<h1><span class=dot></span>Kalshi f6_wait270 — LIVE $5 (real orders) vs paper</h1>
 <div class=sub id=sub>connecting…</div>
 <div class=grid id=match></div>
 <div class=grid id=live></div>
-<h1>Cumulative PnL: <span class=yellow>paper</span> · <span class=green>COM</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
+<h1>Cumulative PnL: <span class=yellow>paper</span> · <span class=green>LIVE $5</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
 <div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
 <div style="margin:8px 0"><button onclick=load()>↻ refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
-<h1>Per-window: <span class=yellow>PAPER</span> vs <span class=blue>US (binance.us)</span> vs <span class=green>COM (binance.com)</span></h1>
+<h1>Per-window: <span class=yellow>PAPER</span> vs <span class=blue>US (binance.us)</span> vs <span class=green>LIVE $5 (binance.com, real)</span></h1>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>US</th><th>entry</th><th>Δ</th><th>=pa</th>
- <th class=sep>COM</th><th>entry</th><th>Δ</th><th>=pa</th></tr></thead><tbody id=cmp></tbody></table>
+ <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=pa</th></tr></thead><tbody id=cmp></tbody></table>
 <script src="/lwc.js"></script>
 <script>
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
@@ -473,7 +473,7 @@ function updateChart(cmp){
  const build=(k)=>{let t=0;const out=[];let last=null;for(const r of rows){const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue; if(r[k]!=null)t+=r[k]; if(ts!==last){out.push({time:ts,value:+t.toFixed(2)});last=ts;}else if(out.length){out[out.length-1].value=+t.toFixed(2);}} return out;};
  const tot=k=>{const a=build(k);return a.length?a[a.length-1].value:0};
  _S.paper.setData(build('pa_pnl')); _S.com.setData(build('com_pnl')); _S.us.setData(build('us_pnl'));
- document.getElementById('chartlbl').textContent=`(paper $${Math.round(tot('pa_pnl'))} · COM $${Math.round(tot('com_pnl'))} · US $${Math.round(tot('us_pnl'))}, ${rows.length} windows)`;
+ document.getElementById('chartlbl').textContent=`(paper $${Math.round(tot('pa_pnl'))} · LIVE $${Math.round(tot('com_pnl'))} · US $${Math.round(tot('us_pnl'))}, ${rows.length} windows)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const L=d.live,S=d.summary;
@@ -481,8 +481,8 @@ async function load(){
  document.getElementById('match').innerHTML=
    card('US ↔ paper side-match',`${f(S.us_pct,1)}%`,S.us_pct>=90?'green':S.us_pct>=70?'yellow':'red',true)
   +card('US: matched / windows',`${S.us_match} / ${S.us_total}`,'blue')
-  +card('COM ↔ paper side-match',`${f(S.com_pct,1)}%`,S.com_pct>=90?'green':S.com_pct>=70?'yellow':'red',true)
-  +card('COM: matched / windows',`${S.com_match} / ${S.com_total}`,'green')
+  +card('LIVE ↔ paper side-match',`${f(S.com_pct,1)}%`,S.com_pct>=90?'green':S.com_pct>=70?'yellow':'red',true)
+  +card('LIVE: matched / windows',`${S.com_match} / ${S.com_total}`,'green')
   +card('positions P/US/COM',`${d.paper_agg.positions}/${d.agg.positions}/${S.com_positions}`);
  document.getElementById('live').innerHTML=
   card('US reason',`<span class="reason ${L.reason&&L.reason.startsWith('BUY')?'green':'yellow'}">${L.reason||'—'}</span>`)
