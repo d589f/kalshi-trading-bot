@@ -1,0 +1,5 @@
+# --- GitHub language stats (Linguist) ---
+# The bot is Rust (kalshi_rs/). Exclude the vendored TradingView lib and the
+# reference Python research package so the repo language reflects the Rust code.
+kalshi_rs/static/lwc.js linguist-vendored
+kalshi_third/** linguist-vendored linguist-generated=false
