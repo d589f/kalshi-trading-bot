@@ -493,12 +493,20 @@ function initChart(){
 // ---- hover tooltip: hold the cursor ~1.1s over a chart point to reveal that window's trade ----
 function setupTip(){
  const tip=document.getElementById('tip');
- _chart.subscribeCrosshairMove(p=>{
+ const wrap=document.getElementById('chartwrap');
+ let curT=null,curX=0,curY=0;
+ // crosshair only RECORDS the time/point under the cursor (does NOT hide the tip),
+ // so the 2s auto-refresh redraw can't clobber a held tooltip.
+ _chart.subscribeCrosshairMove(p=>{ if(p.time&&p.point){curT=p.time;curX=p.point.x;curY=p.point.y;} });
+ // hide only on a REAL pointer move; reveal after ~1s of holding still.
+ wrap.addEventListener('mousemove',()=>{
+  tip.style.display='none';
+  if(_tipTimer)clearTimeout(_tipTimer);
+  _tipTimer=setTimeout(()=>{ if(curT!=null) showTip(curT,curX,curY); },1000);
+ });
+ wrap.addEventListener('mouseleave',()=>{
   if(_tipTimer){clearTimeout(_tipTimer);_tipTimer=null;}
-  tip.style.display='none';                       // hide while the cursor moves
-  if(!p.time||!p.point)return;
-  const x=p.point.x,y=p.point.y,t=p.time;
-  _tipTimer=setTimeout(()=>showTip(t,x,y),1100);  // reveal only after ~1.1s of holding still
+  tip.style.display='none'; curT=null;
  });
 }
 function nearestRow(t){let best=null,bd=1e18;for(const r of (_cmp||[])){const ts=Math.floor(Date.parse(r.window+':00Z')/1000);if(!ts)continue;const d=Math.abs(ts-t);if(d<bd){bd=d;best=r;}}return best;}
