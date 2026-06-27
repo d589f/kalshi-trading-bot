@@ -554,9 +554,12 @@ function updateChart(cmp){
  // two curves are apples-to-apples (LIVE caps/halts no longer make paper look better).
  const build=(k,sc,gate)=>{sc=sc||1;let t=0;const out=[];let last=null;for(const r of rows){const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue; const both=(r.pa_pnl!=null&&r.com_pnl!=null); if(r[k]!=null&&(!gate||both))t+=r[k]*sc; if(ts!==last){out.push({time:ts,value:+t.toFixed(2)});last=ts;}else if(out.length){out[out.length-1].value=+t.toFixed(2);}} return out;};
  const tot=(k,sc,gate)=>{const a=build(k,sc,gate);return a.length?a[a.length-1].value:0};
- _S.paper.setData(build('pa_pnl',1,true)); _S.com.setData(build('com_pnl',LSC,true)); _S.us.setData(build('us_pnl'));
- const mw=rows.filter(r=>r.pa_pnl!=null&&r.com_pnl!=null).length;
- document.getElementById('chartlbl').textContent=`(matched windows only: ${mw} · paper $${Math.round(tot('pa_pnl',1,true))} vs LIVE $${Math.round(tot('com_pnl',LSC,true))} [×20→$100-eq · real $${tot('com_pnl',1,true).toFixed(2)}] · US $${Math.round(tot('us_pnl'))})`;
+ // FULL history (ungated): every trade is its own step on each line, so all paper
+ // losses show and the curve never goes flat just because the other side no-filled.
+ // The no-fill coverage gap is now visible (paper pulls ahead where LIVE missed a fill).
+ _S.paper.setData(build('pa_pnl')); _S.com.setData(build('com_pnl',LSC)); _S.us.setData(build('us_pnl'));
+ const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length, mw=rows.filter(r=>r.pa_pnl!=null&&r.com_pnl!=null).length;
+ document.getElementById('chartlbl').textContent=`(full history · paper $${Math.round(tot('pa_pnl'))} (${paw}w) · LIVE $${Math.round(tot('com_pnl',LSC))} [×20, real $${tot('com_pnl').toFixed(2)}] (${cow}w) · matched ${mw}w · US $${Math.round(tot('us_pnl'))})`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const L=d.live,S=d.summary;
