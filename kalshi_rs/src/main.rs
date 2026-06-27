@@ -122,6 +122,9 @@ struct LiveCfg {
     daily_loss_stop: f64,
     max_count: i64,
     price_buf: f64,
+    /// on a no-fill, re-quote ONE deeper IOC at entry±requote_buf to catch a moved book.
+    /// Applies only to the failed order (normal fills keep price_buf). 0 disables re-quote.
+    requote_buf: f64,
 }
 
 /// MIRROR config (env). When `url` is set, the f6 signal is taken straight from the
@@ -190,6 +193,7 @@ async fn main() -> Result<()> {
         daily_loss_stop: env_f64("DAILY_LOSS_STOP", 30.0),
         max_count: env_i64("MAX_COUNT", 15),
         price_buf: env_f64("PRICE_BUF", 0.02),
+        requote_buf: env_f64("REQUOTE_BUF", 0.12),
     };
     // MIRROR: take the signal from the paper engine (1:1). Off unless MIRROR_STATE_URL set.
     let mcfg = MirrorCfg {
@@ -877,7 +881,7 @@ async fn place_live(
         Side::Yes => "yes",
         Side::No => "no",
     };
-    let (v2side, price) = match fire.side {
+    let (v2side, mut price) = match fire.side {
         Side::Yes => ("bid", (entry + lcfg.price_buf).min(0.99)),
         Side::No => ("ask", ((1.0 - entry) - lcfg.price_buf).max(0.01)),
     };
@@ -889,13 +893,38 @@ async fn place_live(
         count = lcfg.max_count as f64;
     }
     let coid = format!("f6-{}-{}", now_utc.timestamp_millis(), side_str);
-    let (status, resp, lat) = match oc.create_ioc(&book.ticker, v2side, count, price, coid).await {
-        Ok(x) => x,
-        Err(e) => {
-            warn!("LIVE order error: {e}");
-            return;
+    let (mut status, mut resp, mut lat) =
+        match oc.create_ioc(&book.ticker, v2side, count, price, coid.clone()).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("LIVE order error: {e}");
+                return;
+            }
+        };
+    // RE-QUOTE once on a no-fill: the book moved past our limit in the order RTT (fast/choppy
+    // window). Cross deeper — the aggressive price applies ONLY to the failed order, so normal
+    // fills keep the tight buffer. IOC still fills at the real ask (≤ limit), bounded by requote_buf.
+    if status == 201 && resp.fill() <= 0.0 && lcfg.requote_buf > lcfg.price_buf {
+        price = match fire.side {
+            Side::Yes => (entry + lcfg.requote_buf).min(0.97),
+            Side::No => ((1.0 - entry) - lcfg.requote_buf).max(0.03),
+        };
+        info!(
+            "LIVE RE-QUOTE {} {} {}x @ {:.2} (1st no-fill → deeper cross)",
+            book.ticker,
+            side_str.to_uppercase(),
+            count,
+            price
+        );
+        if let Ok((s2, r2, l2)) = oc
+            .create_ioc(&book.ticker, v2side, count, price, format!("{coid}-rq"))
+            .await
+        {
+            status = s2;
+            resp = r2;
+            lat = l2;
         }
-    };
+    }
     if status != 201 {
         warn!("LIVE order rejected HTTP {}", status);
         return;
