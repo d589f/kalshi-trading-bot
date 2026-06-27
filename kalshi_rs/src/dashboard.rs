@@ -232,6 +232,18 @@ impl Dash {
                     "com_pnl": c.and_then(|x| x.pnl),
                     "match_us": match_us,
                     "match_com": match_com,
+                    // --- enriched fields for the hover tooltip ---
+                    "pa_p": p.and_then(|x| x.p_model),
+                    "pa_result": p.and_then(|x| x.result.clone()),
+                    "pa_slug": p.map(|x| x.market_slug.clone()),
+                    "us_p": s.and_then(|x| x.p),
+                    "us_count": s.map(|x| x.count),
+                    "com_p": c.and_then(|x| x.p),
+                    "com_count": c.map(|x| x.count),
+                    "com_ticker": c.map(|x| x.ticker.clone()),
+                    "com_result": c.and_then(|x| x.result.clone()),
+                    "com_won": c.and_then(|x| x.won),
+                    "com_ts": c.map(|x| x.ts_iso.clone()),
                 })
             })
             .collect();
@@ -428,13 +440,24 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  th{color:#8b949e;font-weight:500} td.l,th.l{text-align:left} .sep{border-left:2px solid #30363d}
  .reason{font-size:15px;font-weight:600} button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 12px;cursor:pointer}
  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px;animation:p 1.5s infinite}@keyframes p{50%{opacity:.3}}
+ .tip{position:absolute;z-index:60;display:none;background:#161b22;border:1px solid #444c56;border-radius:9px;padding:11px 13px;font-size:12px;line-height:1.55;box-shadow:0 8px 28px rgba(0,0,0,.65);pointer-events:none;max-width:340px;min-width:230px}
+ .tip h4{margin:0 0 7px;font-size:12.5px;color:#c9d1d9;border-bottom:1px solid #30363d;padding-bottom:5px}
+ .tip h4 .mk{font-weight:400;color:#8b949e;font-size:11px}
+ .tip .seg{margin:6px 0 2px;font-weight:600}
+ .tip .row{display:flex;justify-content:space-between;gap:18px;padding:0px 0}
+ .tip .lbl{color:#8b949e}
+ .tip .none{color:#6e7681;font-style:italic}
 </style></head><body>
 <h1><span class=dot></span>Kalshi f6_wait270 — LIVE $5 (real orders) vs paper</h1>
 <div class=sub id=sub>connecting…</div>
 <div class=grid id=match></div>
 <div class=grid id=live></div>
 <h1>Cumulative PnL: <span class=yellow>paper</span> · <span class=green>LIVE ($5→$100-eq, ×20)</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
+<div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
+<div id=tip class=tip></div>
+</div>
+<div class=sub style="margin-top:4px">наведи на точку графика и задержи курсор ~1с → детали сделки этого окна</div>
 <div style="margin:8px 0"><button onclick=load()>↻ refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
 <h1>Per-window: <span class=yellow>PAPER</span> vs <span class=blue>US (binance.us)</span> vs <span class=green>LIVE $5 (binance.com, real)</span></h1>
 <table><thead><tr><th class=l>window</th>
@@ -448,7 +471,7 @@ const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
 function card(k,v,cls,big){return `<div class="card ${big?'big':''}"><div class=k>${k}</div><div class="v ${big?'vb':''} ${cls||''}">${v}</div></div>`}
 const rc=v=>v==null?'':(v>0?'green':v<0?'red':'');
 const mk=(b)=>b===true?'<span class=green>✓</span>':b===false?'<span class=red>✗</span>':'<span class=dim>·</span>';
-let _chart=null, _S={};
+let _chart=null, _S={}, _cmp=[], _tipTimer=null;
 function initChart(){
  const el=document.getElementById('chart');
  _chart=LightweightCharts.createChart(el,{
@@ -465,10 +488,58 @@ function initChart(){
  _S.paper.createPriceLine({price:0,color:'#555',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
  _chart.applyOptions({width:el.clientWidth,height:340});
+ setupTip();
+}
+// ---- hover tooltip: hold the cursor ~1.1s over a chart point to reveal that window's trade ----
+function setupTip(){
+ const tip=document.getElementById('tip');
+ _chart.subscribeCrosshairMove(p=>{
+  if(_tipTimer){clearTimeout(_tipTimer);_tipTimer=null;}
+  tip.style.display='none';                       // hide while the cursor moves
+  if(!p.time||!p.point)return;
+  const x=p.point.x,y=p.point.y,t=p.time;
+  _tipTimer=setTimeout(()=>showTip(t,x,y),1100);  // reveal only after ~1.1s of holding still
+ });
+}
+function nearestRow(t){let best=null,bd=1e18;for(const r of (_cmp||[])){const ts=Math.floor(Date.parse(r.window+':00Z')/1000);if(!ts)continue;const d=Math.abs(ts-t);if(d<bd){bd=d;best=r;}}return best;}
+function showTip(t,x,y){
+ const tip=document.getElementById('tip'),r=nearestRow(t);
+ if(!r){tip.style.display='none';return;}
+ tip.innerHTML=renderTip(r);tip.style.display='block';
+ const wrap=document.getElementById('chartwrap'),W=wrap.clientWidth,tw=tip.offsetWidth,th=tip.offsetHeight;
+ let lx=x-tw/2;lx=Math.max(4,Math.min(lx,W-tw-4));
+ let ty=y-th-14;if(ty<4)ty=y+18;
+ tip.style.left=lx+'px';tip.style.top=ty+'px';
+}
+function tseg(name,side,entry,delta,p,pnl,res,note){
+ if(!side)return `<div class=seg style="color:#6e7681">${name}: <span class=none>не торговал это окно</span></div>`;
+ const col=side=='YES'?'#3fb950':'#f85149';
+ const rcol=res=='WIN'?'green':res=='LOSS'?'red':'dim';
+ let h=`<div class=seg style="color:${col}">${name}: ${side}${note||''}</div>`;
+ h+=`<div class=row><span class=lbl>entry</span><span>${f(entry)}</span></div>`;
+ h+=`<div class=row><span class=lbl>Δ от open</span><span>${f(delta,1)}</span></div>`;
+ h+=`<div class=row><span class=lbl>p-model</span><span>${f(p,3)}</span></div>`;
+ if(res)h+=`<div class=row><span class=lbl>исход</span><span class=${rcol}>${res}</span></div>`;
+ if(pnl!=null)h+=`<div class=row><span class=lbl>pnl</span><span class="${pnl>=0?'green':'red'}">${pnl>=0?'+':''}${f(pnl)}</span></div>`;
+ return h;
+}
+function renderTip(r){
+ const wt=r.window.slice(5).replace('T',' ');
+ const tkr=r.com_ticker||r.pa_slug||'';
+ let h=`<h4>окно ${wt} <span class=mk>${tkr}</span></h4>`;
+ const cnt=r.com_count?` ${r.com_count}×`:'';
+ const lres=r.com_result||(r.com_won===true?'WIN':r.com_won===false?'LOSS':null);
+ const note=r.com_pnl!=null?` <span class=lbl>($100-eq ${r.com_pnl*20>=0?'+':''}${f(r.com_pnl*20,1)})</span>`:'';
+ h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,r.com_pnl,lres,note);
+ h+=tseg('📄 PAPER $100',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,r.pa_pnl,r.pa_result,'');
+ const m=r.match_com===true?'<span class=green>✓ совпало</span>':r.match_com===false?'<span class=red>✗ разошлось</span>':'<span class=dim>—</span>';
+ h+=`<div class=row style="margin-top:6px;border-top:1px solid #30363d;padding-top:5px"><span class=lbl>сторона LIVE↔paper</span><span>${m}</span></div>`;
+ return h;
 }
 function updateChart(cmp){
  if(typeof LightweightCharts==='undefined'){return}
  if(!_chart) initChart();
+ _cmp=cmp;
  const rows=cmp.slice().reverse();
  const LSC=20; // LIVE $5 -> $100-equivalent so the curve scales alongside paper ($100)
  // gate=true → accumulate ONLY on windows where BOTH paper and LIVE resolved, so the
