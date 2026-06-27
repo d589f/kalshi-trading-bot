@@ -452,7 +452,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=sub id=sub>connecting…</div>
 <div class=grid id=match></div>
 <div class=grid id=live></div>
-<h1>Cumulative PnL: <span class=yellow>paper</span> · <span class=green>LIVE ($5→$100-eq, ×20)</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
+<h1>Cumulative PnL (apples-to-apples): <span class=yellow>paper $5-twin</span> · <span class=green>LIVE $5 real</span> <span class=dim>(both ×20→$100-eq, identical Kalshi economics)</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
 <div id=tip class=tip></div>
@@ -471,6 +471,12 @@ const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
 function card(k,v,cls,big){return `<div class="card ${big?'big':''}"><div class=k>${k}</div><div class="v ${big?'vb':''} ${cls||''}">${v}</div></div>`}
 const rc=v=>v==null?'':(v>0?'green':v<0?'red':'');
 const mk=(b)=>b===true?'<span class=green>✓</span>':b===false?'<span class=red>✗</span>':'<span class=dim>·</span>';
+// $5 Kalshi-economics TWIN of a paper trade: run the paper signal through the SAME economics
+// as the live bot (integer count=round($5/entry) cap 15, Kalshi fee on win AND loss, loss=-cost),
+// then ×20 BOTH curves. This strips the accounting-model artifacts (fractional shares, Polymarket
+// fee, -$100 flat loss) so paper-vs-LIVE shows only the REAL gap: slippage + no-fills.
+function kfee(c,p){return (p<=0||p>=1||c<=0)?0:Math.ceil(0.07*c*p*(1-p)*100)/100;}
+function twin5(entry,won){if(entry==null||entry<=0)return null;let c=Math.round(5/entry);if(c<1)c=1;if(c>15)c=15;const cost=c*entry+kfee(c,entry);return won?(c-cost):(-cost);}
 let _chart=null, _S={}, _cmp=[], _tipTimer=null;
 function initChart(){
  const el=document.getElementById('chart');
@@ -539,7 +545,9 @@ function renderTip(r){
  const lres=r.com_result||(r.com_won===true?'WIN':r.com_won===false?'LOSS':null);
  const note=r.com_pnl!=null?` <span class=lbl>($100-eq ${r.com_pnl*20>=0?'+':''}${f(r.com_pnl*20,1)})</span>`:'';
  h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,r.com_pnl,lres,note);
- h+=tseg('📄 PAPER $100',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,r.pa_pnl,r.pa_result,'');
+ const ptw=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
+ const pnote=ptw!=null?` <span class=lbl>($100-eq ${ptw*20>=0?'+':''}${f(ptw*20,1)} · orig-$100 ${r.pa_pnl>=0?'+':''}${f(r.pa_pnl,0)})</span>`:'';
+ h+=tseg('📄 PAPER $5-twin',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,ptw,r.pa_result,pnote);
  const m=r.match_com===true?'<span class=green>✓ совпало</span>':r.match_com===false?'<span class=red>✗ разошлось</span>':'<span class=dim>—</span>';
  h+=`<div class=row style="margin-top:6px;border-top:1px solid #30363d;padding-top:5px"><span class=lbl>сторона LIVE↔paper</span><span>${m}</span></div>`;
  return h;
@@ -548,6 +556,7 @@ function updateChart(cmp){
  if(typeof LightweightCharts==='undefined'){return}
  if(!_chart) initChart();
  _cmp=cmp;
+ for(const r of cmp){ r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null; }
  const rows=cmp.slice().reverse();
  const LSC=20; // LIVE $5 -> $100-equivalent so the curve scales alongside paper ($100)
  // gate=true → accumulate ONLY on windows where BOTH paper and LIVE resolved, so the
@@ -557,9 +566,12 @@ function updateChart(cmp){
  // FULL history (ungated): every trade is its own step on each line, so all paper
  // losses show and the curve never goes flat just because the other side no-filled.
  // The no-fill coverage gap is now visible (paper pulls ahead where LIVE missed a fill).
- _S.paper.setData(build('pa_pnl')); _S.com.setData(build('com_pnl',LSC)); _S.us.setData(build('us_pnl'));
- const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length, mw=rows.filter(r=>r.pa_pnl!=null&&r.com_pnl!=null).length;
- document.getElementById('chartlbl').textContent=`(full history · paper $${Math.round(tot('pa_pnl'))} (${paw}w) · LIVE $${Math.round(tot('com_pnl',LSC))} [×20, real $${tot('com_pnl').toFixed(2)}] (${cow}w) · matched ${mw}w · US $${Math.round(tot('us_pnl'))})`;
+ // paper plotted as its $5 Kalshi-twin (×20) so it runs IDENTICAL economics to LIVE —
+ // the remaining paper-vs-LIVE gap is then only real slippage + no-fills, not accounting.
+ _S.paper.setData(build('pa_twin',LSC)); _S.com.setData(build('com_pnl',LSC)); _S.us.setData(build('us_pnl'));
+ const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length;
+ const paOrig=Math.round(tot('pa_pnl'));
+ document.getElementById('chartlbl').textContent=`($5 Kalshi-economics, ×20 both · paper-twin $${Math.round(tot('pa_twin',LSC))} (${paw}w) vs LIVE $${Math.round(tot('com_pnl',LSC))} [real $${tot('com_pnl').toFixed(2)}] (${cow}w) · gap now = slippage+no-fills only · paper orig-$100 model was $${paOrig})`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const L=d.live,S=d.summary;
