@@ -273,21 +273,35 @@ async fn main() -> Result<()> {
     if let Ok(push_url) = std::env::var("PUSH_TRIGGERS_URL") {
         let d = dash.clone();
         let token = std::env::var("DASH_TOKEN").unwrap_or_default();
-        info!("push mode: posting triggers to {push_url}");
+        // also push the live signal snapshot so the dashboard shows OUR real binance.com signal,
+        // not the host's low-volume binance.US shadow.
+        let live_url = push_url.replace("/shadow_com", "/live_com");
+        info!("push mode: triggers → {push_url} · live signal → {live_url}");
         tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let body = {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let (trig_body, live_body) = {
                     let dd = d.lock().unwrap();
-                    serde_json::to_string(&dd.triggers).unwrap_or_default()
+                    (
+                        serde_json::to_string(&dd.triggers).unwrap_or_default(),
+                        serde_json::to_string(&dd.live).unwrap_or_default(),
+                    )
                 };
                 let _ = client
                     .post(&push_url)
                     .header("X-Token", &token)
                     .header("Content-Type", "application/json")
                     .timeout(Duration::from_secs(8))
-                    .body(body)
+                    .body(trig_body)
+                    .send()
+                    .await;
+                let _ = client
+                    .post(&live_url)
+                    .header("X-Token", &token)
+                    .header("Content-Type", "application/json")
+                    .timeout(Duration::from_secs(8))
+                    .body(live_body)
                     .send()
                     .await;
             }

@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 /// Latest live signal snapshot (updated every 0.3s tick).
-#[derive(Default, Clone, Serialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct LiveSnap {
     pub market: String,
     pub btc: f64,
@@ -98,6 +98,10 @@ pub struct Dash {
     /// triggers from the SECOND shadow (EU box, Binance.com feed), pushed via POST /shadow_com
     pub shadow_com: Vec<TrigSummary>,
     pub shadow_com_updated: String,
+    /// live signal snapshot pushed from the EU mirror bot — the REAL binance.com signal we trade
+    /// (the local `live` field is Buffalo's low-volume binance.US shadow, kept as a fallback)
+    pub live_com: LiveSnap,
+    pub live_com_updated: String,
     pub started_iso: String,
 }
 
@@ -272,6 +276,8 @@ impl Dash {
         let pct = |ok: i64, n: i64| if n > 0 { (1000.0 * ok as f64 / n as f64).round() / 10.0 } else { 0.0 };
         json!({
             "live": self.live,
+            "live_com": self.live_com,
+            "live_com_updated": self.live_com_updated,
             "agg": self.agg(),
             "paper_agg": self.paper_agg(),
             "compare": cmp,
@@ -350,6 +356,20 @@ pub async fn serve(dash: Arc<Mutex<Dash>>, port: u16) {
                             d.shadow_com = trigs;
                             d.shadow_com_updated = d.live.updated_iso.clone();
                             ("200 OK", "application/json", json!({"ok": true, "n": n}).to_string())
+                        }
+                        Err(e) => ("400 Bad Request", "text/plain", format!("parse: {e}")),
+                    }
+                }
+            } else if method == "POST" && path.starts_with("/live_com") {
+                if bad_token {
+                    ("403 Forbidden", "text/plain", "bad token".to_string())
+                } else {
+                    match serde_json::from_str::<LiveSnap>(&body) {
+                        Ok(snap) => {
+                            let mut d = dash.lock().unwrap();
+                            d.live_com_updated = snap.updated_iso.clone();
+                            d.live_com = snap;
+                            ("200 OK", "application/json", json!({"ok": true}).to_string())
                         }
                         Err(e) => ("400 Bad Request", "text/plain", format!("parse: {e}")),
                     }
@@ -574,8 +594,11 @@ function updateChart(cmp){
  document.getElementById('chartlbl').textContent=`($5 Kalshi-economics, ×20 both · paper-twin $${Math.round(tot('pa_twin',LSC))} (${paw}w) vs LIVE $${Math.round(tot('com_pnl',LSC))} [real $${tot('com_pnl').toFixed(2)}] (${cow}w) · gap now = slippage+no-fills only · paper orig-$100 model was $${paOrig})`;
 }
 async function load(){
- try{const r=await fetch('/stats');const d=await r.json();const L=d.live,S=d.summary;
- document.getElementById('sub').textContent=`updated ${L.updated_iso} · since ${d.started} · US-feed ${L.binance_feed} · COM upd ${S.com_updated||'—'} · paper upd ${d.paper_agg.updated||'—'}`;
+ try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
+ // prefer the EU mirror's REAL binance.com signal; fall back to Buffalo's binance.US shadow
+ const L=(d.live_com&&d.live_com.market)?d.live_com:d.live;
+ const feedlbl=(d.live_com&&d.live_com.market)?'binance.com · EU mirror (REAL signal we trade)':(L.binance_feed+' · US shadow');
+ document.getElementById('sub').textContent=`signal ${L.updated_iso} · ${feedlbl} · since ${d.started} · LIVE push ${d.live_com_updated||'—'} · paper ${d.paper_agg.updated||'—'}`;
  document.getElementById('match').innerHTML=
    card('US ↔ paper side-match',`${f(S.us_pct,1)}%`,S.us_pct>=90?'green':S.us_pct>=70?'yellow':'red',true)
   +card('US: matched / windows',`${S.us_match} / ${S.us_total}`,'blue')
@@ -583,8 +606,8 @@ async function load(){
   +card('LIVE: matched / windows',`${S.com_match} / ${S.com_total}`,'green')
   +card('positions P/US/COM',`${d.paper_agg.positions}/${d.agg.positions}/${S.com_positions}`);
  document.getElementById('live').innerHTML=
-  card('US reason',`<span class="reason ${L.reason&&L.reason.startsWith('BUY')?'green':'yellow'}">${L.reason||'—'}</span>`)
-  +card('market',L.market||'—')+card('BTC us',f(L.btc,0))
+  card('reason',`<span class="reason ${L.reason&&L.reason.startsWith('BUY')?'green':'yellow'}">${L.reason||'—'}</span>`)
+  +card('market',L.market||'—')+card('BTC',f(L.btc,0))
   +card('Δ open',f(L.delta_open),rc(L.delta_open))+card('τ',f(L.tau,2))+card('elapsed',f(L.elapsed,1))
   +card('σ max30',f(L.sigma_max30,6))+card('p',f(L.p,3))+card('yes/no ask',f(L.yes_ask)+'/'+f(L.no_ask));
  updateChart(d.compare);
