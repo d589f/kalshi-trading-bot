@@ -37,6 +37,11 @@ pub struct LiveSnap {
     pub updated_iso: String,
     pub binance_feed: String,
     pub order_mode: String,
+    /// authoritative REAL live PnL pushed from the bot (fees + slippage included)
+    #[serde(default)]
+    pub day_pnl: f64,
+    #[serde(default)]
+    pub total_pnl: f64,
 }
 
 /// One live would-be order + its settlement (filled in by the resolver).
@@ -251,7 +256,7 @@ impl Dash {
                 })
             })
             .collect();
-        out.truncate(60);
+        out.truncate(300); // full history for the chart cumulative; the table slices to recent rows
         out
     }
 
@@ -470,9 +475,10 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 </style></head><body>
 <h1><span class=dot></span>Kalshi f6_wait270 — LIVE $5 (real orders) vs paper</h1>
 <div class=sub id=sub>connecting…</div>
+<div class=grid id=realpnl></div>
 <div class=grid id=match></div>
 <div class=grid id=live></div>
-<h1>Cumulative PnL (apples-to-apples): <span class=yellow>paper $5-twin</span> · <span class=green>LIVE $5 real</span> <span class=dim>(both ×20→$100-eq, identical Kalshi economics)</span> · <span class=blue>US</span> <span id=chartlbl class=dim></span></h1>
+<h1>Real cumulative PnL <span class=dim>(actual $5 money, all fees + slippage included)</span>: <span class=yellow>paper $5-twin</span> vs <span class=green>LIVE real</span> <span id=chartlbl class=dim></span></h1>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
 <div id=tip class=tip></div>
@@ -487,6 +493,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <script src="/lwc.js"></script>
 <script>
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
+const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
 const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
 function card(k,v,cls,big){return `<div class="card ${big?'big':''}"><div class=k>${k}</div><div class="v ${big?'vb':''} ${cls||''}">${v}</div></div>`}
 const rc=v=>v==null?'':(v>0?'green':v<0?'red':'');
@@ -563,10 +570,9 @@ function renderTip(r){
  let h=`<h4>окно ${wt} <span class=mk>${tkr}</span></h4>`;
  const cnt=r.com_count?` ${r.com_count}×`:'';
  const lres=r.com_result||(r.com_won===true?'WIN':r.com_won===false?'LOSS':null);
- const note=r.com_pnl!=null?` <span class=lbl>($100-eq ${r.com_pnl*20>=0?'+':''}${f(r.com_pnl*20,1)})</span>`:'';
- h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,r.com_pnl,lres,note);
+ h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,r.com_pnl,lres,'');
  const ptw=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
- const pnote=ptw!=null?` <span class=lbl>($100-eq ${ptw*20>=0?'+':''}${f(ptw*20,1)} · orig-$100 ${r.pa_pnl>=0?'+':''}${f(r.pa_pnl,0)})</span>`:'';
+ const pnote=ptw!=null?` <span class=lbl>(orig $100-model ${r.pa_pnl>=0?'+':''}${f(r.pa_pnl,0)})</span>`:'';
  h+=tseg('📄 PAPER $5-twin',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,ptw,r.pa_result,pnote);
  const m=r.match_com===true?'<span class=green>✓ совпало</span>':r.match_com===false?'<span class=red>✗ разошлось</span>':'<span class=dim>—</span>';
  h+=`<div class=row style="margin-top:6px;border-top:1px solid #30363d;padding-top:5px"><span class=lbl>сторона LIVE↔paper</span><span>${m}</span></div>`;
@@ -578,9 +584,7 @@ function updateChart(cmp){
  _cmp=cmp;
  for(const r of cmp){ r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null; }
  const rows=cmp.slice().reverse();
- const LSC=20; // LIVE $5 -> $100-equivalent so the curve scales alongside paper ($100)
- // gate=true → accumulate ONLY on windows where BOTH paper and LIVE resolved, so the
- // two curves are apples-to-apples (LIVE caps/halts no longer make paper look better).
+ // gate=true would accumulate only on both-resolved windows; we plot ungated full history.
  const build=(k,sc,gate)=>{sc=sc||1;let t=0;const out=[];let last=null;for(const r of rows){const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue; const both=(r.pa_pnl!=null&&r.com_pnl!=null); if(r[k]!=null&&(!gate||both))t+=r[k]*sc; if(ts!==last){out.push({time:ts,value:+t.toFixed(2)});last=ts;}else if(out.length){out[out.length-1].value=+t.toFixed(2);}} return out;};
  const tot=(k,sc,gate)=>{const a=build(k,sc,gate);return a.length?a[a.length-1].value:0};
  // FULL history (ungated): every trade is its own step on each line, so all paper
@@ -588,10 +592,11 @@ function updateChart(cmp){
  // The no-fill coverage gap is now visible (paper pulls ahead where LIVE missed a fill).
  // paper plotted as its $5 Kalshi-twin (×20) so it runs IDENTICAL economics to LIVE —
  // the remaining paper-vs-LIVE gap is then only real slippage + no-fills, not accounting.
- _S.paper.setData(build('pa_twin',LSC)); _S.com.setData(build('com_pnl',LSC)); _S.us.setData(build('us_pnl'));
+ // REAL $5 dollars — no ×20. Both lines run identical $5 Kalshi economics (integer contracts,
+ // Kalshi fee on win+loss, loss=-cost), so the gap = real slippage + no-fills. US shadow dropped.
+ _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_pnl'));
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length;
- const paOrig=Math.round(tot('pa_pnl'));
- document.getElementById('chartlbl').textContent=`($5 Kalshi-economics, ×20 both · paper-twin $${Math.round(tot('pa_twin',LSC))} (${paw}w) vs LIVE $${Math.round(tot('com_pnl',LSC))} [real $${tot('com_pnl').toFixed(2)}] (${cow}w) · gap now = slippage+no-fills only · paper orig-$100 model was $${paOrig})`;
+ document.getElementById('chartlbl').textContent=`(real $5 · paper-twin ${money(tot('pa_twin'))} over ${paw}w  vs  LIVE ${money(tot('com_pnl'))} over ${cow}w · gap = slippage + no-fills · authoritative total → cards above)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
@@ -599,6 +604,17 @@ async function load(){
  const L=(d.live_com&&d.live_com.market)?d.live_com:d.live;
  const feedlbl=(d.live_com&&d.live_com.market)?'binance.com · EU mirror (REAL signal we trade)':(L.binance_feed+' · US shadow');
  document.getElementById('sub').textContent=`signal ${L.updated_iso} · ${feedlbl} · since ${d.started} · LIVE push ${d.live_com_updated||'—'} · paper ${d.paper_agg.updated||'—'}`;
+ // ===== authoritative REAL money (pushed from the bot, fees+slippage in) + period paper-vs-live =====
+ const lc=d.live_com||{};
+ let pT=0,pL=0,nL=0,wL=0;
+ for(const c of d.compare){ if(c.pa_pnl!=null&&c.pa_entry){pT+=twin5(c.pa_entry,c.pa_pnl>0);} if(c.com_pnl!=null){pL+=c.com_pnl;nL++;if(c.com_pnl>0)wL++;} }
+ const edge=pT!=0?Math.round(100*pL/pT):0;
+ document.getElementById('realpnl').innerHTML=
+   card('💵 LIVE real · ALL-TIME',money(lc.total_pnl),rc(lc.total_pnl),true)
+  +card('LIVE real · today',money(lc.day_pnl),rc(lc.day_pnl),true)
+  +card('paper $5-twin (period)',money(pT),rc(pT))
+  +card('LIVE (period)',`${money(pL)} · ${nL}w · WR ${nL?Math.round(100*wL/nL):0}%`,rc(pL))
+  +card('live = % of paper',pT!=0?`${edge}%`:'—',edge>=90?'green':edge>=70?'yellow':'red');
  document.getElementById('match').innerHTML=
    card('US ↔ paper side-match',`${f(S.us_pct,1)}%`,S.us_pct>=90?'green':S.us_pct>=70?'yellow':'red',true)
   +card('US: matched / windows',`${S.us_match} / ${S.us_total}`,'blue')
@@ -611,7 +627,7 @@ async function load(){
   +card('Δ open',f(L.delta_open),rc(L.delta_open))+card('τ',f(L.tau,2))+card('elapsed',f(L.elapsed,1))
   +card('σ max30',f(L.sigma_max30,6))+card('p',f(L.p,3))+card('yes/no ask',f(L.yes_ask)+'/'+f(L.no_ask));
  updateChart(d.compare);
- document.getElementById('cmp').innerHTML=d.compare.map(c=>
+ document.getElementById('cmp').innerHTML=d.compare.slice(0,60).map(c=>
    `<tr><td class=l>${c.window}</td>
     <td class="sep ${sc(c.pa_side)}">${c.pa_side||'—'}</td><td>${f(c.pa_entry)}</td><td>${f(c.pa_delta,1)}</td><td class="${rc(c.pa_pnl)}">${c.pa_pnl==null?'…':(c.pa_pnl>=0?'+':'')+f(c.pa_pnl)}</td>
     <td class="sep ${sc(c.us_side)}">${c.us_side||'—'}</td><td>${f(c.us_entry)}</td><td>${f(c.us_delta,1)}</td><td>${mk(c.match_us)}</td>

@@ -144,6 +144,26 @@ struct LiveState {
     day: String,
     trades_today: i64,
     day_pnl: f64,
+    /// authoritative all-time real PnL across every resolved live trade (fees included)
+    #[serde(default)]
+    total_pnl: f64,
+}
+
+/// Sum the real PnL of every resolved trade in the ledger — the authoritative all-time total.
+fn total_pnl_from_ledger() -> f64 {
+    let mut tot = 0.0;
+    if let Ok(content) = std::fs::read_to_string(LEDGER_PATH) {
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("kind").and_then(|k| k.as_str()) == Some("resolve") {
+                    if let Some(p) = v.get("pnl_usd").and_then(|p| p.as_f64()) {
+                        tot += p;
+                    }
+                }
+            }
+        }
+    }
+    (tot * 100.0).round() / 100.0
 }
 
 fn load_live_state() -> LiveState {
@@ -205,6 +225,15 @@ async fn main() -> Result<()> {
     }
     let http = reqwest::Client::new();
     let live_state = Arc::new(Mutex::new(load_live_state()));
+    // backfill the authoritative all-time total from the ledger if it's not tracked yet
+    {
+        let mut s = live_state.lock().unwrap();
+        if s.total_pnl == 0.0 {
+            s.total_pnl = total_pnl_from_ledger();
+            save_live_state(&s);
+            info!("total real PnL (all-time, from ledger): ${:+.2}", s.total_pnl);
+        }
+    }
     let order_client: Option<Arc<OrderClient>> =
         match (std::env::var("KALSHI_KEY_ID"), std::env::var("KALSHI_KEY_PATH")) {
             (Ok(kid), Ok(kpath)) => match std::fs::read_to_string(&kpath) {
@@ -473,6 +502,7 @@ async fn resolver(
                         if pd.live {
                             let mut s = live_state.lock().unwrap();
                             s.day_pnl = ((s.day_pnl + pnl) * 100.0).round() / 100.0;
+                            s.total_pnl = ((s.total_pnl + pnl) * 100.0).round() / 100.0;
                             save_live_state(&s);
                             info!(
                                 "🟢 LIVE RESOLVED {} {} result={} won={} pnl=${:+.2} (day_pnl=${:+.2})",
@@ -687,8 +717,14 @@ async fn signal_loop(
             }
         };
         {
+            let (day_pnl, total_pnl) = {
+                let s = live_state.lock().unwrap();
+                (s.day_pnl, s.total_pnl)
+            };
             let mut dl = dash.lock().unwrap();
             let l = &mut dl.live;
+            l.day_pnl = day_pnl;
+            l.total_pnl = total_pnl;
             l.market = book.ticker.clone();
             l.btc = price;
             l.delta_open = shared.delta_from_open;
@@ -860,7 +896,7 @@ async fn place_live(
         let mut s = live_state.lock().unwrap();
         let today = now_utc.format("%Y-%m-%d").to_string();
         if s.day != today {
-            *s = LiveState { day: today, trades_today: 0, day_pnl: 0.0 };
+            *s = LiveState { day: today, trades_today: 0, day_pnl: 0.0, total_pnl: s.total_pnl };
             save_live_state(&s);
         }
         if s.trades_today >= lcfg.max_trades_day {
