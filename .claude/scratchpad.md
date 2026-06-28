@@ -38,6 +38,15 @@ Full plan: `.claude/plan-live-exec-telemetry-latch-fix.md`
 ### Wave 6
 - [ ] Slice 7: regression guard (pricing/sizing/MIRROR diff-clean) + full cargo gate
 
+## Order-connection keep-warm (added 2026-06-28 ~22:05 UTC) — commit 955a9f6
+Root cause of the ~250-400ms order latency = COLD TCP+TLS per order (measured on EU box:
+cold ~270ms TLS handshake vs ~10ms warm; ping to CloudFront PoP = 4.8ms, so NOT distance).
+OrderClient had its own pool, orders fire ~once/15min > reqwest ~90s idle → cold every time.
+Fix: pool_idle_timeout(None) + tcp_keepalive(30s) on OrderClient; main.rs spawns a warm-ping
+(GET /portfolio/balance every ORDER_WARM_SECS=30) so the order POST is ~1 RTT. Behavior-neutral.
+Validation = OPERATIONAL: watch latency_ms in new ledger fills drop from ~250 toward ~100-150.
+DEPLOY in progress: backups ts 20260628-220447. (rebuild ~8min on-box + restart.)
+
 ## Notes
 - 27 tests pass; clippy clean on new code; pricing/sizing/order-send byte-identical (P0 = telemetry only).
 - Deploy ordering: slices 4+5 ship together (4 writes nofill/skip rows; 5 makes loader ignore them). Both committed.
