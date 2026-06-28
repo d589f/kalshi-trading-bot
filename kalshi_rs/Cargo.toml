@@ -16,8 +16,9 @@ futures-util = "0.3"
 # websockets (rustls — no OpenSSL link needed)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
-# http client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# http client — http2 enables a single multiplexed, PING-kept-alive connection to Kalshi
+# so the order POST reuses a warm connection (~105ms) instead of a cold TCP+TLS (~280ms).
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls"] }
 
 # json / serialization
 serde = { version = "1", features = ["derive"] }

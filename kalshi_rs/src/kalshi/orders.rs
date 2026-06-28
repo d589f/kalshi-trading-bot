@@ -65,14 +65,18 @@ pub struct OrderClient {
 
 impl OrderClient {
     pub fn new(base: impl Into<String>, signer: Signer) -> Result<Self> {
-        // Orders fire ~once/15min — far past reqwest's default ~90s idle timeout — so without
-        // these each order would re-establish TCP+TLS (~250-400ms cold vs ~10ms warm, measured
-        // from the EU box). Keep idle connections forever and TCP-keepalive them; a periodic
-        // warm-ping task (see main.rs) actually exercises the socket so it never goes stale.
+        // Orders fire ~once/15min — far past the idle window — so a cold order pays a fresh
+        // TCP+TLS handshake (~280ms vs ~105ms warm, measured EU→Kalshi). HTTP/2 holds ONE
+        // multiplexed connection per host, kept alive by PING frames even while idle, so the
+        // order POST reuses the warm connection. (HTTP/1.1 pooling did NOT reliably reuse it.)
+        // The warm-ping task in main.rs establishes/refreshes the connection; h2 PINGs keep it.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .pool_idle_timeout(None)
             .tcp_keepalive(std::time::Duration::from_secs(30))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .build()?;
         Ok(Self {
             base: base.into(),
