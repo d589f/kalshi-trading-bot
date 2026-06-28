@@ -369,7 +369,7 @@ async fn main() -> Result<()> {
     }
 
     // 4) Signal loop @ 0.3s
-    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http).await;
+    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http, rest).await;
     Ok(())
 }
 
@@ -546,6 +546,7 @@ async fn signal_loop(
     live_state: Arc<Mutex<LiveState>>,
     mcfg: MirrorCfg,
     http: reqwest::Client,
+    rest: Arc<KalshiRest>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     let mut fired_window: Option<String> = None;
@@ -765,6 +766,7 @@ async fn signal_loop(
                         &fire,
                         now,
                         now_utc,
+                        &rest,
                     )
                     .await;
                 } else {
@@ -890,6 +892,7 @@ async fn place_live(
     fire: &engine::Fire,
     now: f64,
     now_utc: DateTime<Utc>,
+    rest: &KalshiRest,
 ) {
     // daily reset + caps
     {
@@ -917,11 +920,26 @@ async fn place_live(
         Side::Yes => "yes",
         Side::No => "no",
     };
-    let (v2side, mut price) = match fire.side {
-        Side::Yes => ("bid", (entry + lcfg.price_buf).min(0.99)),
-        Side::No => ("ask", ((1.0 - entry) - lcfg.price_buf).max(0.01)),
+    // FRESH orderbook at order time: size + price off the CURRENT real ask (not the ~0.5s-old
+    // mirrored paper ask). Gate/coverage stay on the signal entry (1:1 with paper), but execution
+    // runs on the live book so the IOC crosses the current ask — deploys exactly $5 (no over-size)
+    // and fills first-try (no deep re-quote overshoot). Falls back to the signal entry on any error.
+    let exec_entry = match rest.get_orderbook(&book.ticker, 10).await {
+        Ok(raw) => {
+            let fb = KalshiBook::derive(&book.ticker, &raw, None, now);
+            let a = match fire.side {
+                Side::Yes => fb.yes_ask,
+                Side::No => fb.no_ask,
+            };
+            a.filter(|v| *v > 0.50 && *v <= 0.98).unwrap_or(entry)
+        }
+        Err(_) => entry,
     };
-    let mut count = (lcfg.stake / entry).round();
+    let (v2side, mut price) = match fire.side {
+        Side::Yes => ("bid", (exec_entry + lcfg.price_buf).min(0.99)),
+        Side::No => ("ask", ((1.0 - exec_entry) - lcfg.price_buf).max(0.01)),
+    };
+    let mut count = (lcfg.stake / exec_entry).round();
     if count < 1.0 {
         count = 1.0;
     }
@@ -942,8 +960,8 @@ async fn place_live(
     // fills keep the tight buffer. IOC still fills at the real ask (≤ limit), bounded by requote_buf.
     if status == 201 && resp.fill() <= 0.0 && lcfg.requote_buf > lcfg.price_buf {
         price = match fire.side {
-            Side::Yes => (entry + lcfg.requote_buf).min(0.97),
-            Side::No => ((1.0 - entry) - lcfg.requote_buf).max(0.03),
+            Side::Yes => (exec_entry + lcfg.requote_buf).min(0.97),
+            Side::No => ((1.0 - exec_entry) - lcfg.requote_buf).max(0.03),
         };
         info!(
             "LIVE RE-QUOTE {} {} {}x @ {:.2} (1st no-fill → deeper cross)",
