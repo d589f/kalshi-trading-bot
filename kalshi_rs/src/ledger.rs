@@ -139,6 +139,7 @@ impl Outcome {
 /// expect) and every new field is either always-present or `Option` + skipped-when-none,
 /// so old loaders still parse and old records (no `outcome`) still read as fills.
 #[derive(Serialize, Debug, Clone)]
+#[allow(dead_code)] // wired into place_live in slice 3
 pub struct LiveTriggerRecord {
     pub kind: &'static str, // always "trigger"
     pub live: bool,         // always true
@@ -189,6 +190,7 @@ impl LiveTriggerRecord {
     /// Base record with the always-present context fields set and every order/fill
     /// field empty. Callers fill in the order fields on the paths where they apply.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // wired into place_live in slice 3
     pub fn new(
         outcome: Outcome,
         ts: f64,

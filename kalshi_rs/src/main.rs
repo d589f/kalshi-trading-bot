@@ -34,7 +34,7 @@ use kalshi::auth::Signer;
 use kalshi::orders::OrderClient;
 use kalshi::rest::{KalshiRest, PROD_BASE, SERIES_KXBTC15M};
 use kalshi::{kalshi_fee_usd, pick_market_for_close, KalshiBook};
-use ledger::{Ledger, ResolveRecord, TriggerRecord};
+use ledger::{Ledger, Outcome, ResolveRecord, TriggerRecord};
 use signal::{compute_all_sigmas, compute_ofi, p_model_classic};
 use state::AppState;
 
@@ -58,6 +58,74 @@ fn now_secs() -> f64 {
 /// Kalshi close_time format: "2026-06-25T10:15:00Z"
 fn kalshi_rfc3339(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Inputs to the live-order outcome decision, mirroring `place_live`'s gate order
+/// exactly (daily-cap → loss-stop → band → order-error → rejected → no-fill → partial
+/// → filled). Pure so the classification can be unit-tested without sending an order.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct GateSnapshot {
+    pub trades_today: i64,
+    pub max_trades_day: i64,
+    pub day_pnl: f64,
+    pub daily_loss_stop: f64,
+    pub entry: f64,
+    pub max_entry_price: f64,
+    pub order_err: bool,
+    pub status: u16,
+    pub fill: f64,
+    pub remaining_count: i64,
+}
+
+/// Classify a live-order attempt into an [`Outcome`] in EXACTLY `place_live`'s gate
+/// order. The band predicate is byte-identical to the `place_live` band check
+/// (`!(0.50 < entry && entry <= max_entry_price)`). Wired into `place_live` in a later slice.
+#[cfg_attr(not(test), allow(dead_code))]
+// band check kept byte-identical to place_live's `!(0.50 < entry && entry <= max)`.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+pub(crate) fn classify_outcome(g: &GateSnapshot) -> Outcome {
+    if g.trades_today >= g.max_trades_day {
+        return Outcome::SkipDailyCap;
+    }
+    if g.day_pnl <= -g.daily_loss_stop {
+        return Outcome::SkipLossStop;
+    }
+    if !(0.50 < g.entry && g.entry <= g.max_entry_price) {
+        return Outcome::SkipBand;
+    }
+    if g.order_err {
+        return Outcome::OrderError;
+    }
+    if g.status != 201 {
+        return Outcome::Rejected;
+    }
+    if g.fill <= 0.0 {
+        return Outcome::Nofill;
+    }
+    if g.remaining_count > 0 {
+        return Outcome::Partial;
+    }
+    Outcome::Filled
+}
+
+/// Decompose the entry gap of a filled live order:
+/// `gap = eff - signal_entry`, `drift = exec_entry - signal_entry`, `walk = eff - exec_entry`.
+/// By construction `drift + walk == gap`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decompose_gap(signal_entry: f64, exec_entry: f64, eff: f64) -> (f64, f64, f64) {
+    let gap = eff - signal_entry;
+    let drift = exec_entry - signal_entry;
+    let walk = eff - exec_entry;
+    (gap, drift, walk)
+}
+
+/// Whether a ledger "trigger" row with this `outcome` represents a real position and
+/// should be counted as a dashboard trigger. `None` = legacy record (live rows were
+/// only ever written on a fill) → counts. Wired into the loader in a later slice.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_dashboard_trigger(outcome: Option<Outcome>) -> bool {
+    outcome.is_none_or(|o| o.is_position())
 }
 
 /// Replay the JSONL ledger into the dashboard so shadow history survives restarts.
@@ -1041,4 +1109,121 @@ async fn place_live(
         "🟢 LIVE FILLED {} {} {}x @ {:.3} (lat {}ms, fee ${:.3})",
         book.ticker, side_str.to_uppercase(), fill, eff, lat, fee
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gate() -> GateSnapshot {
+        // a "passing" snapshot: caps OK, in band, order 201, full fill
+        GateSnapshot {
+            trades_today: 0,
+            max_trades_day: 96,
+            day_pnl: 0.0,
+            daily_loss_stop: 50.0,
+            entry: 0.70,
+            max_entry_price: 0.92,
+            order_err: false,
+            status: 201,
+            fill: 7.0,
+            remaining_count: 0,
+        }
+    }
+
+    #[test]
+    fn classify_fill_partial_nofill() {
+        assert_eq!(classify_outcome(&gate()), Outcome::Filled);
+        let mut g = gate();
+        g.remaining_count = 3;
+        assert_eq!(classify_outcome(&g), Outcome::Partial);
+        let mut g = gate();
+        g.fill = 0.0;
+        assert_eq!(classify_outcome(&g), Outcome::Nofill);
+    }
+
+    #[test]
+    fn classify_skips_and_errors() {
+        let mut g = gate();
+        g.trades_today = 96;
+        assert_eq!(classify_outcome(&g), Outcome::SkipDailyCap);
+
+        let mut g = gate();
+        g.day_pnl = -50.0;
+        assert_eq!(classify_outcome(&g), Outcome::SkipLossStop);
+
+        let mut g = gate();
+        g.entry = 0.40;
+        assert_eq!(classify_outcome(&g), Outcome::SkipBand);
+
+        let mut g = gate();
+        g.order_err = true;
+        assert_eq!(classify_outcome(&g), Outcome::OrderError);
+
+        let mut g = gate();
+        g.status = 400;
+        assert_eq!(classify_outcome(&g), Outcome::Rejected);
+    }
+
+    #[test]
+    fn classify_band_edges() {
+        // entry == 0.50 → not (0.50 < entry) → SkipBand
+        let mut g = gate();
+        g.entry = 0.50;
+        assert_eq!(classify_outcome(&g), Outcome::SkipBand);
+        // entry == max_entry → allowed (entry <= max) → not band
+        let mut g = gate();
+        g.entry = 0.92;
+        assert_eq!(classify_outcome(&g), Outcome::Filled);
+        // just above max → SkipBand
+        let mut g = gate();
+        g.entry = 0.93;
+        assert_eq!(classify_outcome(&g), Outcome::SkipBand);
+    }
+
+    #[test]
+    fn classify_precedence_cap_wins() {
+        // daily-cap AND loss-stop AND band all tripped → cap wins (checked first)
+        let mut g = gate();
+        g.trades_today = 96;
+        g.day_pnl = -100.0;
+        g.entry = 0.40;
+        assert_eq!(classify_outcome(&g), Outcome::SkipDailyCap);
+    }
+
+    #[test]
+    fn decompose_gap_basic_and_identity() {
+        // paper said 0.51, fresh ask was 0.69, filled at 0.75
+        let (gap, drift, walk) = decompose_gap(0.51, 0.69, 0.75);
+        assert!((gap - 0.24).abs() < 1e-9);
+        assert!((drift - 0.18).abs() < 1e-9);
+        assert!((walk - 0.06).abs() < 1e-9);
+        // identity always holds
+        assert!((drift + walk - gap).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decompose_gap_degenerate_when_exec_equals_signal() {
+        let (gap, drift, walk) = decompose_gap(0.70, 0.70, 0.72);
+        assert!((drift).abs() < 1e-9);
+        assert!((walk - gap).abs() < 1e-9);
+    }
+
+    #[test]
+    fn is_dashboard_trigger_filter() {
+        // legacy (no outcome) counts as a fill
+        assert!(is_dashboard_trigger(None));
+        assert!(is_dashboard_trigger(Some(Outcome::Filled)));
+        assert!(is_dashboard_trigger(Some(Outcome::Partial)));
+        for o in [
+            Outcome::Nofill,
+            Outcome::SkipDailyCap,
+            Outcome::SkipLossStop,
+            Outcome::SkipBand,
+            Outcome::OrderError,
+            Outcome::Rejected,
+        ] {
+            assert!(!is_dashboard_trigger(Some(o)), "{o:?} must not count");
+        }
+    }
 }
