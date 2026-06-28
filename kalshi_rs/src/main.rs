@@ -45,6 +45,15 @@ fn env_i64(k: &str, d: i64) -> i64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+/// Resolve the entry-price cap: an env `MAX_ENTRY` override (clamped to a sane (0.5, 0.99])
+/// wins over the session default, so the live gate can be tightened without a rebuild.
+fn resolve_max_entry(default: f64, env_val: Option<String>) -> f64 {
+    env_val
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.5 && *v <= 0.99)
+        .unwrap_or(default)
+}
+
 const SESSION_NAME: &str = "f6_wait270_shadow";
 const LEDGER_PATH: &str = "shadow_ledger.jsonl";
 
@@ -382,7 +391,8 @@ async fn main() -> Result<()> {
     let base = std::env::var("KALSHI_BASE").unwrap_or_else(|_| PROD_BASE.to_string());
     info!("kalshi base = {base}");
 
-    let cfg = SessionConfig::f6_wait270();
+    let mut cfg = SessionConfig::f6_wait270();
+    cfg.max_entry_price = resolve_max_entry(cfg.max_entry_price, std::env::var("MAX_ENTRY").ok());
     info!(
         "session '{}': entry_wait={}min delta>={} p>={} sigma={} max_entry={} stake=${}",
         cfg.name,
@@ -1710,5 +1720,15 @@ mod tests {
         let v: Vec<TrigSummary> =
             serde_json::from_str(r#"[{"ticker":"X","side":"yes","entry":0.7}]"#).unwrap();
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn resolve_max_entry_override() {
+        assert_eq!(resolve_max_entry(0.92, Some("0.85".into())), 0.85); // valid override
+        assert_eq!(resolve_max_entry(0.92, None), 0.92); // unset -> default
+        assert_eq!(resolve_max_entry(0.92, Some("junk".into())), 0.92); // unparsable -> default
+        assert_eq!(resolve_max_entry(0.92, Some("1.5".into())), 0.92); // > 0.99 -> default
+        assert_eq!(resolve_max_entry(0.92, Some("0.40".into())), 0.92); // <= 0.5 -> default
+        assert_eq!(resolve_max_entry(0.92, Some("0.99".into())), 0.99); // upper edge ok
     }
 }
