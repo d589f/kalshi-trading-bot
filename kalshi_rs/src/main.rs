@@ -463,6 +463,27 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Keep the order connection HOT. Orders fire ~once/15min — far past reqwest's idle window —
+    // so a cold order pays a fresh TCP+TLS handshake (~250-400ms measured from the EU box vs
+    // ~10ms warm). A light signed GET /portfolio/balance every ORDER_WARM_SECS exercises the
+    // pooled connection so the real order POST is ~1 RTT. Read-only; never touches trading logic.
+    if lcfg.enabled {
+        if let Some(oc) = &order_client {
+            let oc = oc.clone();
+            let warm_secs = env_f64("ORDER_WARM_SECS", 30.0).max(5.0);
+            info!("order connection keep-warm every {warm_secs:.0}s (GET /portfolio/balance)");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs_f64(warm_secs));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = oc.balance_dollars().await {
+                        warn!("order keep-warm ping failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
     // Persistent comparison cutoff: survives restarts (so deploys don't wipe the dashboard
     // history). Stored in `.cutoff` in the working dir; first run stamps now.
     let cutoff = match std::fs::read_to_string(".cutoff") {

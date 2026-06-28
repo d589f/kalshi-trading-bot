@@ -65,8 +65,14 @@ pub struct OrderClient {
 
 impl OrderClient {
     pub fn new(base: impl Into<String>, signer: Signer) -> Result<Self> {
+        // Orders fire ~once/15min — far past reqwest's default ~90s idle timeout — so without
+        // these each order would re-establish TCP+TLS (~250-400ms cold vs ~10ms warm, measured
+        // from the EU box). Keep idle connections forever and TCP-keepalive them; a periodic
+        // warm-ping task (see main.rs) actually exercises the socket so it never goes stale.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(None)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self {
             base: base.into(),
