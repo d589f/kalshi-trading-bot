@@ -2,7 +2,7 @@
 
 ## Branch: feat/live-exec-telemetry-latch-fix
 
-## Status: Wave 1 complete (slices 1-2 done) — paused before Wave 2 (main.rs order-path slices)
+## Status: P0 telemetry complete (slices 1-5 done) — HARD STOP before slice 6 (P0b, real-money) per user
 
 ## Context
 Live Kalshi f6 trader overpays vs paper. MEASURED on prod (EU box, 2026-06-28): real all-time PnL −$11.42; entry drag vs paper +$12.23 over 163 trades (≈ the whole loss). Mean gap +1.12c, median 0, momentum right-tail (13% pay ≥6c, max +24c). No-fill ~9%, each burns the window (latch-before-await bug). Live ledger persists too little to decompose. This feature: P0 makes the gap measurable, P0b stops the window-burn. Pricing strategy UNCHANGED. PRICE_BUF/REQUOTE_BUF tuning is a SEPARATE later step (user approves separately, after P0b).
@@ -17,19 +17,25 @@ Full plan: `.claude/plan-live-exec-telemetry-latch-fix.md`
 - [x] Slice 2: main.rs pure helpers classify_outcome/decompose_gap/is_dashboard_trigger + tests — 86279b5
 
 ### Wave 2
-- [ ] Slice 3: main.rs replace json! fill row with typed record (FILL path, no behavior change) — architect pre-review
+- [x] Slice 3: typed fill record (FILL path, no behavior change) — bcb55f6
 
 ### Wave 3
-- [ ] Slice 4: main.rs place_live -> Outcome + append row on every skip/error/no-fill path — security+architect pre-review
+- [x] Slice 4: place_live -> Outcome + row on every skip/error/no-fill path — 4a7fdc1
 
 ### Wave 4
-- [ ] Slice 5: main.rs load_ledger_into_dash outcome filter (legacy=filled) — architect pre-review
+- [x] Slice 5: load_ledger_into_dash outcome filter (legacy=filled) — 0f7d08b
 
-### Wave 5
-- [ ] Slice 6: P0b latch fix + bounded retry (REAL-MONEY) — security+architect pre-review + shadow validation before prod
+### Wave 5  [STOP — needs user go-ahead + shadow validation]
+- [ ] Slice 6: P0b latch fix + bounded retry (REAL-MONEY). N=2/C=3 defaults; N=1/C=0 == legacy.
 
 ### Wave 6
 - [ ] Slice 7: regression guard (pricing/sizing/MIRROR diff-clean) + full cargo gate
+
+## Notes
+- 27 tests pass; clippy clean on new code; pricing/sizing/order-send byte-identical (P0 = telemetry only).
+- Deploy ordering: slices 4+5 ship together (4 writes nofill/skip rows; 5 makes loader ignore them). Both committed.
+- Once deployed, the new live ledger fields let us decompose the gap: drift = exec_entry-signal_entry, walk = eff-exec_entry. THEN tune PRICE_BUF/REQUOTE_BUF on data.
+- Branch only; nothing pushed; prod untouched.
 
 ## Completed
 - Bootstrap docs: PRD §1, use cases (67 scenarios), architecture review (PASS), QA (81 test cases), plan (7 slices).
