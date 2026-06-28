@@ -122,8 +122,7 @@ pub(crate) fn decompose_gap(signal_entry: f64, exec_entry: f64, eff: f64) -> (f6
 
 /// Whether a ledger "trigger" row with this `outcome` represents a real position and
 /// should be counted as a dashboard trigger. `None` = legacy record (live rows were
-/// only ever written on a fill) → counts. Wired into the loader in a later slice.
-#[cfg_attr(not(test), allow(dead_code))]
+/// only ever written on a fill) → counts.
 pub(crate) fn is_dashboard_trigger(outcome: Option<Outcome>) -> bool {
     outcome.is_none_or(|o| o.is_position())
 }
@@ -231,37 +230,63 @@ fn load_ledger_into_dash(path: &str, dash: &Arc<Mutex<Dash>>) {
     };
     let mut d = dash.lock().unwrap();
     for line in content.lines() {
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        match v.get("kind").and_then(|k| k.as_str()) {
-            Some("trigger") => d.triggers.push(TrigSummary {
-                ts_iso: v["ts_iso"].as_str().unwrap_or("").to_string(),
-                window_start: v["window_start"].as_str().unwrap_or("").to_string(),
-                window_end: v["window_end"].as_str().unwrap_or("").to_string(),
-                ticker: v["market_ticker"].as_str().unwrap_or("").to_string(),
-                side: v["side"].as_str().unwrap_or("").to_string(),
-                entry: v["entry"].as_f64().unwrap_or(0.0),
-                count: v["count"].as_i64().unwrap_or(0),
-                delta: v["delta_from_open"].as_f64().unwrap_or(0.0),
-                p: v["p"].as_f64(),
-                result: None,
-                won: None,
-                pnl: None,
-            }),
-            Some("resolve") => d.resolve(
-                v["market_ticker"].as_str().unwrap_or(""),
-                v["side"].as_str().unwrap_or(""),
-                v["entry"].as_f64().unwrap_or(0.0),
-                v["result"].as_str().unwrap_or(""),
-                v["won"].as_bool().unwrap_or(false),
-                v["pnl_usd"].as_f64().unwrap_or(0.0),
-            ),
-            _ => {}
-        }
+        replay_line_into(&mut d, line);
     }
     info!("loaded {} shadow triggers from ledger", d.triggers.len());
+}
+
+/// Parse a ledger `outcome` tag. Returns `None` for an unrecognized tag (callers treat
+/// an unrecognized tag conservatively — not a confirmed position).
+fn outcome_from_str(s: &str) -> Option<Outcome> {
+    serde_json::from_value::<Outcome>(serde_json::Value::String(s.to_string())).ok()
+}
+
+/// Replay one JSONL line into the dashboard. A `trigger` row is counted as a dashboard
+/// trigger only when it is a real position: a filled/partial outcome, OR a legacy row
+/// with no `outcome` field (live rows were historically written only on fills). nofill/
+/// skip/error rows — and rows with an unrecognized `outcome` — are NOT counted. Malformed
+/// lines are skipped without aborting the replay.
+fn replay_line_into(d: &mut Dash, line: &str) {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    match v.get("kind").and_then(|k| k.as_str()) {
+        Some("trigger") => {
+            let push = match v.get("outcome") {
+                None => is_dashboard_trigger(None), // legacy fill row
+                Some(val) => match val.as_str().and_then(outcome_from_str) {
+                    Some(o) => is_dashboard_trigger(Some(o)),
+                    None => false, // present but unrecognized → conservatively skip
+                },
+            };
+            if push {
+                d.triggers.push(TrigSummary {
+                    ts_iso: v["ts_iso"].as_str().unwrap_or("").to_string(),
+                    window_start: v["window_start"].as_str().unwrap_or("").to_string(),
+                    window_end: v["window_end"].as_str().unwrap_or("").to_string(),
+                    ticker: v["market_ticker"].as_str().unwrap_or("").to_string(),
+                    side: v["side"].as_str().unwrap_or("").to_string(),
+                    entry: v["entry"].as_f64().unwrap_or(0.0),
+                    count: v["count"].as_i64().unwrap_or(0),
+                    delta: v["delta_from_open"].as_f64().unwrap_or(0.0),
+                    p: v["p"].as_f64(),
+                    result: None,
+                    won: None,
+                    pnl: None,
+                });
+            }
+        }
+        Some("resolve") => d.resolve(
+            v["market_ticker"].as_str().unwrap_or(""),
+            v["side"].as_str().unwrap_or(""),
+            v["entry"].as_f64().unwrap_or(0.0),
+            v["result"].as_str().unwrap_or(""),
+            v["won"].as_bool().unwrap_or(false),
+            v["pnl_usd"].as_f64().unwrap_or(0.0),
+        ),
+        _ => {}
+    }
 }
 
 /// A fired order awaiting Kalshi settlement (shadow would-be, or a real live fill).
@@ -312,21 +337,27 @@ struct LiveState {
     total_pnl: f64,
 }
 
-/// Sum the real PnL of every resolved trade in the ledger — the authoritative all-time total.
-fn total_pnl_from_ledger() -> f64 {
+/// Sum the real PnL of every `resolve` row in a ledger string. Telemetry rows
+/// (`kind:"trigger"`, including nofill/skip) are ignored — only settlements count.
+fn sum_resolve_pnl(content: &str) -> f64 {
     let mut tot = 0.0;
-    if let Ok(content) = std::fs::read_to_string(LEDGER_PATH) {
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("kind").and_then(|k| k.as_str()) == Some("resolve") {
-                    if let Some(p) = v.get("pnl_usd").and_then(|p| p.as_f64()) {
-                        tot += p;
-                    }
+    for line in content.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("kind").and_then(|k| k.as_str()) == Some("resolve") {
+                if let Some(p) = v.get("pnl_usd").and_then(|p| p.as_f64()) {
+                    tot += p;
                 }
             }
         }
     }
     (tot * 100.0).round() / 100.0
+}
+
+/// Sum the real PnL of every resolved trade in the ledger — the authoritative all-time total.
+fn total_pnl_from_ledger() -> f64 {
+    std::fs::read_to_string(LEDGER_PATH)
+        .map(|c| sum_resolve_pnl(&c))
+        .unwrap_or(0.0)
 }
 
 fn load_live_state() -> LiveState {
@@ -1597,5 +1628,66 @@ mod tests {
         ] {
             assert!(!o.is_position(), "{o:?} is not a position");
         }
+    }
+
+    #[test]
+    fn loader_filters_outcome() {
+        // legacy (no outcome) + filled + partial should count; nofill + skip should not.
+        let lines = [
+            r#"{"kind":"trigger","ts_iso":"t","market_ticker":"A","side":"yes","entry":0.7,"count":7,"delta_from_open":1.0}"#,
+            r#"{"kind":"trigger","outcome":"filled","market_ticker":"B","side":"yes","entry":0.7,"count":7}"#,
+            r#"{"kind":"trigger","outcome":"partial","market_ticker":"C","side":"no","entry":0.6,"count":4}"#,
+            r#"{"kind":"trigger","outcome":"nofill","market_ticker":"D","side":"yes","entry":0.6}"#,
+            r#"{"kind":"trigger","outcome":"skip_daily_cap","market_ticker":"E","side":"no","entry":0.6}"#,
+            r#"{"kind":"trigger","outcome":"bogus_tag","market_ticker":"F","side":"no","entry":0.6}"#,
+            r#"{"kind":"resolve","market_ticker":"B","side":"yes","entry":0.7,"result":"yes","won":true,"pnl_usd":2.5}"#,
+        ];
+        let mut d = Dash::default();
+        for l in lines {
+            replay_line_into(&mut d, l);
+        }
+        // A (legacy), B (filled), C (partial) → 3; D/E/F (nofill/skip/unknown) excluded
+        assert_eq!(d.triggers.len(), 3);
+    }
+
+    #[test]
+    fn loader_legacy_no_outcome_counts() {
+        let mut d = Dash::default();
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"trigger","market_ticker":"A","side":"yes","entry":0.7,"count":7}"#,
+        );
+        assert_eq!(d.triggers.len(), 1);
+    }
+
+    #[test]
+    fn loader_malformed_line_skipped() {
+        let mut d = Dash::default();
+        replay_line_into(&mut d, r#"{"kind":"trigger","outcome":"filled","market_ticker":"A","side":"yes","entry":0.7}"#);
+        replay_line_into(&mut d, "this is not json {{{");
+        replay_line_into(&mut d, r#"{"kind":"trigger","outcome":"filled","market_ticker":"B","side":"no","entry":0.6}"#);
+        // both valid fills loaded; the garbage line did not abort or panic
+        assert_eq!(d.triggers.len(), 2);
+    }
+
+    #[test]
+    fn total_pnl_ignores_telemetry() {
+        let content = [
+            r#"{"kind":"trigger","outcome":"filled","entry":0.7}"#,
+            r#"{"kind":"trigger","outcome":"nofill","entry":0.7}"#,
+            r#"{"kind":"resolve","pnl_usd":2.5}"#,
+            r#"{"kind":"resolve","pnl_usd":-1.0}"#,
+        ]
+        .join("\n");
+        // only the two resolves count: 2.5 + (-1.0) = 1.5
+        assert!((sum_resolve_pnl(&content) - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trigsummary_shape_unchanged() {
+        // the dashboard /shadow loader still deserializes Vec<TrigSummary> (serde(default) fields)
+        let v: Vec<TrigSummary> =
+            serde_json::from_str(r#"[{"ticker":"X","side":"yes","entry":0.7}]"#).unwrap();
+        assert_eq!(v.len(), 1);
     }
 }
