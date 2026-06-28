@@ -2,7 +2,14 @@
 
 ## Branch: feat/live-exec-telemetry-latch-fix
 
-## Status: P0 telemetry complete (slices 1-5 done) — HARD STOP before slice 6 (P0b, real-money) per user
+## Status: P0 telemetry DEPLOYED TO PROD (slices 1-5) — HARD STOP before slice 6 (P0b, real-money) per user
+
+## Deploy note (2026-06-28 ~15:20 UTC)
+P0 telemetry live on EU box (kalshi-shadow-com, PID 465625, new binary built on-box 8m18s).
+Behavior byte-identical; only the live ledger format changed. Verified on a real fill:
+new records carry outcome + signal_entry/exec_entry/first_limit_price/requote/remaining/fill/eff/latency.
+Backups for rollback: /home/dmitrii/kalshi_rs/{target/release/kalshi_bot,src/main.rs,src/ledger.rs}.bak.20260628-180739
+TODO when data accrues: validate gap decomposition semantics on NO-side trades (saw one eff=0.39 vs exec_entry=0.65 fill worth a sanity check); then tune PRICE_BUF/REQUOTE_BUF on data. Branch not pushed/merged.
 
 ## Context
 Live Kalshi f6 trader overpays vs paper. MEASURED on prod (EU box, 2026-06-28): real all-time PnL −$11.42; entry drag vs paper +$12.23 over 163 trades (≈ the whole loss). Mean gap +1.12c, median 0, momentum right-tail (13% pay ≥6c, max +24c). No-fill ~9%, each burns the window (latch-before-await bug). Live ledger persists too little to decompose. This feature: P0 makes the gap measurable, P0b stops the window-burn. Pricing strategy UNCHANGED. PRICE_BUF/REQUOTE_BUF tuning is a SEPARATE later step (user approves separately, after P0b).
