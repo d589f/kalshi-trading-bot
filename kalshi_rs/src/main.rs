@@ -188,6 +188,41 @@ pub(crate) fn build_fill_record(
     r
 }
 
+/// Build a context-only record (order/fill fields unset) for a skip / error / no-fill
+/// path. There is no effective fill, so the legacy `entry` key carries `signal_entry`.
+/// Callers set whatever order fields apply to their path before appending.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_context_record(
+    outcome: Outcome,
+    ts: f64,
+    ts_iso: String,
+    window_start: String,
+    window_end: String,
+    market_ticker: String,
+    side: &str,
+    signal_entry: f64,
+    orderbook_entry: f64,
+    p: Option<f64>,
+    delta_from_open: f64,
+) -> LiveTriggerRecord {
+    let mut r = LiveTriggerRecord::new(
+        outcome,
+        ts,
+        ts_iso,
+        SESSION_NAME.to_string(),
+        window_start,
+        window_end,
+        market_ticker,
+        side.to_string(),
+        signal_entry,
+        Some(signal_entry),
+        p,
+        delta_from_open,
+    );
+    r.orderbook_entry = Some(orderbook_entry);
+    r
+}
+
 /// Replay the JSONL ledger into the dashboard so shadow history survives restarts.
 fn load_ledger_into_dash(path: &str, dash: &Arc<Mutex<Dash>>) {
     let content = match std::fs::read_to_string(path) {
@@ -1021,33 +1056,60 @@ async fn place_live(
     now: f64,
     now_utc: DateTime<Utc>,
     rest: &KalshiRest,
-) {
-    // daily reset + caps
-    {
+) -> Outcome {
+    let side_str: &'static str = match fire.side {
+        Side::Yes => "yes",
+        Side::No => "no",
+    };
+    let entry = fire.entry;
+    // a context-only record for any skip/error/no-fill path (order fields set per-path below).
+    // Self-contained (computes window strings on call) so the fill path stays unchanged.
+    let ctx = |outcome: Outcome| {
+        build_context_record(
+            outcome,
+            now,
+            now_utc.to_rfc3339(),
+            win.window_start.map(|w| w.to_rfc3339()).unwrap_or_default(),
+            win.window_end.map(|w| w.to_rfc3339()).unwrap_or_default(),
+            book.ticker.clone(),
+            side_str,
+            entry,
+            fire.orderbook_entry,
+            fire.p,
+            shared.delta_from_open.unwrap_or(0.0),
+        )
+    };
+
+    // daily reset + caps — compute the gate flags INSIDE the live_state lock, but append
+    // the ledger row OUTSIDE it (never hold the state mutex across Ledger::append's mutex).
+    let (cap_hit, loss_hit, day_pnl_now) = {
         let mut s = live_state.lock().unwrap();
         let today = now_utc.format("%Y-%m-%d").to_string();
         if s.day != today {
             *s = LiveState { day: today, trades_today: 0, day_pnl: 0.0, total_pnl: s.total_pnl };
             save_live_state(&s);
         }
-        if s.trades_today >= lcfg.max_trades_day {
-            warn!("LIVE HALT: max {} trades/day reached", lcfg.max_trades_day);
-            return;
-        }
-        if s.day_pnl <= -lcfg.daily_loss_stop {
-            warn!("LIVE HALT: daily loss stop (${:+.2} <= -${})", s.day_pnl, lcfg.daily_loss_stop);
-            return;
-        }
+        (
+            s.trades_today >= lcfg.max_trades_day,
+            s.day_pnl <= -lcfg.daily_loss_stop,
+            s.day_pnl,
+        )
+    };
+    if cap_hit {
+        warn!("LIVE HALT: max {} trades/day reached", lcfg.max_trades_day);
+        ledger.append(&ctx(Outcome::SkipDailyCap));
+        return Outcome::SkipDailyCap;
     }
-    let entry = fire.entry;
+    if loss_hit {
+        warn!("LIVE HALT: daily loss stop (${:+.2} <= -${})", day_pnl_now, lcfg.daily_loss_stop);
+        ledger.append(&ctx(Outcome::SkipLossStop));
+        return Outcome::SkipLossStop;
+    }
     if !(0.50 < entry && entry <= cfg.max_entry_price) {
         warn!("LIVE SKIP: entry {:.2} out of (0.50, {:.2}]", entry, cfg.max_entry_price);
-        return;
+        ledger.append(&ctx(Outcome::SkipBand));
+        return Outcome::SkipBand;
     }
-    let side_str: &'static str = match fire.side {
-        Side::Yes => "yes",
-        Side::No => "no",
-    };
     // FRESH orderbook at order time: size + price off the CURRENT real ask (not the ~0.5s-old
     // mirrored paper ask). Gate/coverage stay on the signal entry (1:1 with paper), but execution
     // runs on the live book so the IOC crosses the current ask — deploys exactly $5 (no over-size)
@@ -1085,7 +1147,11 @@ async fn place_live(
             Ok(x) => x,
             Err(e) => {
                 warn!("LIVE order error: {e}");
-                return;
+                let mut r = ctx(Outcome::OrderError);
+                r.exec_entry = Some(exec_entry);
+                r.first_limit_price = Some(first_limit_price);
+                ledger.append(&r);
+                return Outcome::OrderError;
             }
         };
     // RE-QUOTE once on a no-fill: the book moved past our limit in the order RTT (fast/choppy
@@ -1116,7 +1182,14 @@ async fn place_live(
     }
     if status != 201 {
         warn!("LIVE order rejected HTTP {}", status);
-        return;
+        let mut r = ctx(Outcome::Rejected);
+        r.exec_entry = Some(exec_entry);
+        r.first_limit_price = Some(first_limit_price);
+        r.requote = Some(requoted);
+        r.requote_limit_price = requote_limit_price;
+        r.latency_ms = Some(lat as i64);
+        ledger.append(&r);
+        return Outcome::Rejected;
     }
     let fill = resp.fill();
     if fill <= 0.0 {
@@ -1124,7 +1197,16 @@ async fn place_live(
             "LIVE NO-FILL {} {} {}x @ limit {:.2} (rem {})",
             book.ticker, side_str.to_uppercase(), count, price, resp.remaining_count
         );
-        return; // nothing filled -> no position
+        let rem = resp.remaining_count.parse::<f64>().unwrap_or(0.0);
+        let mut r = ctx(Outcome::Nofill);
+        r.exec_entry = Some(exec_entry);
+        r.first_limit_price = Some(first_limit_price);
+        r.requote = Some(requoted);
+        r.requote_limit_price = requote_limit_price;
+        r.remaining_count = Some(rem as i64);
+        r.latency_ms = Some(lat as i64);
+        ledger.append(&r);
+        return Outcome::Nofill; // nothing filled -> no position
     }
     // effective per-contract entry of the side actually bought
     let eff = match fire.side {
@@ -1198,6 +1280,7 @@ async fn place_live(
         "🟢 LIVE FILLED {} {} {}x @ {:.3} (lat {}ms, fee ${:.3})",
         book.ticker, side_str.to_uppercase(), fill, eff, lat, fee
     );
+    outcome
 }
 
 #[cfg(test)]
@@ -1438,5 +1521,81 @@ mod tests {
         assert_ne!(v["first_limit_price"], v["requote_limit_price"]);
         // empty order_id is omitted, not written as ""
         assert!(v.get("order_id").is_none());
+    }
+
+    fn ctx_rec(outcome: Outcome) -> LiveTriggerRecord {
+        build_context_record(
+            outcome,
+            1.0,
+            "2026-06-28T12:00:00+00:00".into(),
+            "ws".into(),
+            "we".into(),
+            "KXBTC15M-26JUN281145-45".into(),
+            "no",
+            0.58, // signal_entry
+            0.58, // orderbook_entry
+            Some(0.71),
+            -77.0,
+        )
+    }
+
+    #[test]
+    fn build_context_record_skip_paths() {
+        for o in [
+            Outcome::SkipDailyCap,
+            Outcome::SkipLossStop,
+            Outcome::SkipBand,
+        ] {
+            let v: serde_json::Value = serde_json::to_value(ctx_rec(o)).unwrap();
+            assert_eq!(v["kind"], "trigger");
+            assert_eq!(v["outcome"], serde_json::to_value(o).unwrap());
+            // no fill happened: entry carries the signal entry, eff/exec/fill/latency absent
+            assert_eq!(v["entry"], 0.58);
+            assert_eq!(v["signal_entry"], 0.58);
+            assert!(v.get("eff").is_none());
+            assert!(v.get("exec_entry").is_none());
+            assert!(v.get("fill").is_none());
+            assert!(v.get("latency_ms").is_none());
+            // context kept for diffing
+            assert_eq!(v["orderbook_entry"], 0.58);
+            assert_eq!(v["delta_from_open"], -77.0);
+        }
+    }
+
+    #[test]
+    fn context_record_nofill_shape() {
+        // mirror what place_live sets on the no-fill path
+        let mut r = ctx_rec(Outcome::Nofill);
+        r.exec_entry = Some(0.60);
+        r.first_limit_price = Some(0.34);
+        r.requote = Some(true);
+        r.requote_limit_price = Some(0.30);
+        r.remaining_count = Some(7);
+        r.latency_ms = Some(426);
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["outcome"], "nofill");
+        assert!(v.get("eff").is_none()); // never filled
+        assert!(v.get("fee").is_none());
+        assert_eq!(v["exec_entry"], 0.60);
+        assert_eq!(v["remaining_count"], 7);
+        assert_eq!(v["requote"], true);
+        assert_eq!(v["latency_ms"], 426);
+    }
+
+    #[test]
+    fn outcome_position_semantics() {
+        // only fills/partials are positions (and reach the pending/dashboard push)
+        assert!(Outcome::Filled.is_position());
+        assert!(Outcome::Partial.is_position());
+        for o in [
+            Outcome::Nofill,
+            Outcome::SkipDailyCap,
+            Outcome::SkipLossStop,
+            Outcome::SkipBand,
+            Outcome::OrderError,
+            Outcome::Rejected,
+        ] {
+            assert!(!o.is_position(), "{o:?} is not a position");
+        }
     }
 }
