@@ -34,7 +34,7 @@ use kalshi::auth::Signer;
 use kalshi::orders::OrderClient;
 use kalshi::rest::{KalshiRest, PROD_BASE, SERIES_KXBTC15M};
 use kalshi::{kalshi_fee_usd, pick_market_for_close, KalshiBook};
-use ledger::{Ledger, Outcome, ResolveRecord, TriggerRecord};
+use ledger::{Ledger, LiveTriggerRecord, Outcome, ResolveRecord, TriggerRecord};
 use signal::{compute_all_sigmas, compute_ofi, p_model_classic};
 use state::AppState;
 
@@ -126,6 +126,66 @@ pub(crate) fn decompose_gap(signal_entry: f64, exec_entry: f64, eff: f64) -> (f6
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_dashboard_trigger(outcome: Option<Outcome>) -> bool {
     outcome.is_none_or(|o| o.is_position())
+}
+
+/// Build the typed fill/partial ledger record from `place_live`'s fill-path locals.
+/// The legacy JSON `entry` key carries `eff` (resolver/dashboard read it); the paper/signal
+/// entry goes into the additive `signal_entry` field so `gap = eff - signal_entry`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_fill_record(
+    outcome: Outcome,
+    ts: f64,
+    ts_iso: String,
+    window_start: String,
+    window_end: String,
+    market_ticker: String,
+    side: &str,
+    signal_entry: f64,
+    orderbook_entry: f64,
+    p: Option<f64>,
+    delta_from_open: f64,
+    exec_entry: f64,
+    first_limit_price: f64,
+    requote: bool,
+    requote_limit_price: Option<f64>,
+    remaining_count: i64,
+    fill: f64,
+    eff: f64,
+    fee: f64,
+    latency_ms: i64,
+    order_id: &str,
+) -> LiveTriggerRecord {
+    let mut r = LiveTriggerRecord::new(
+        outcome,
+        ts,
+        ts_iso,
+        SESSION_NAME.to_string(),
+        window_start,
+        window_end,
+        market_ticker,
+        side.to_string(),
+        eff, // legacy `entry` key = effective fill
+        Some(signal_entry),
+        p,
+        delta_from_open,
+    );
+    r.exec_entry = Some(exec_entry);
+    r.orderbook_entry = Some(orderbook_entry);
+    r.first_limit_price = Some(first_limit_price);
+    r.requote = Some(requote);
+    r.requote_limit_price = requote_limit_price;
+    r.remaining_count = Some(remaining_count);
+    r.fill = Some(fill);
+    r.eff = Some(eff);
+    r.fee = Some(fee);
+    r.latency_ms = Some(latency_ms);
+    r.order_id = if order_id.is_empty() {
+        None
+    } else {
+        Some(order_id.to_string())
+    };
+    r.count = Some(fill as i64);
+    r
 }
 
 /// Replay the JSONL ledger into the dashboard so shadow history survives restarts.
@@ -1007,6 +1067,11 @@ async fn place_live(
         Side::Yes => ("bid", (exec_entry + lcfg.price_buf).min(0.99)),
         Side::No => ("ask", ((1.0 - exec_entry) - lcfg.price_buf).max(0.01)),
     };
+    // telemetry-only: capture the first limit BEFORE a possible re-quote overwrites `price`.
+    // These locals never feed `create_ioc`, so the order is byte-identical to before.
+    let first_limit_price = price;
+    let mut requoted = false;
+    let mut requote_limit_price: Option<f64> = None;
     let mut count = (lcfg.stake / exec_entry).round();
     if count < 1.0 {
         count = 1.0;
@@ -1031,6 +1096,8 @@ async fn place_live(
             Side::Yes => (exec_entry + lcfg.requote_buf).min(0.97),
             Side::No => ((1.0 - exec_entry) - lcfg.requote_buf).max(0.03),
         };
+        requoted = true;
+        requote_limit_price = Some(price);
         info!(
             "LIVE RE-QUOTE {} {} {}x @ {:.2} (1st no-fill → deeper cross)",
             book.ticker,
@@ -1073,13 +1140,35 @@ async fn place_live(
     }
     let w_start = win.window_start.map(|w| w.to_rfc3339()).unwrap_or_default();
     let w_end = win.window_end.map(|w| w.to_rfc3339()).unwrap_or_default();
-    ledger.append(&serde_json::json!({
-        "kind": "trigger", "live": true, "ts": now, "ts_iso": now_utc.to_rfc3339(),
-        "session": SESSION_NAME, "window_start": w_start.clone(), "window_end": w_end.clone(),
-        "market_ticker": book.ticker.clone(), "side": side_str, "entry": eff, "count": fill as i64,
-        "delta_from_open": shared.delta_from_open.unwrap_or(0.0), "p": fire.p,
-        "order_id": resp.order_id, "fee": fee, "latency_ms": lat as i64,
-    }));
+    let remaining = resp.remaining_count.parse::<f64>().unwrap_or(0.0);
+    let outcome = if remaining > 0.0 {
+        Outcome::Partial
+    } else {
+        Outcome::Filled
+    };
+    ledger.append(&build_fill_record(
+        outcome,
+        now,
+        now_utc.to_rfc3339(),
+        w_start.clone(),
+        w_end.clone(),
+        book.ticker.clone(),
+        side_str,
+        entry, // fire.entry — the paper/signal entry
+        fire.orderbook_entry,
+        fire.p,
+        shared.delta_from_open.unwrap_or(0.0),
+        exec_entry,
+        first_limit_price,
+        requoted,
+        requote_limit_price,
+        remaining as i64,
+        fill,
+        eff,
+        fee,
+        lat as i64,
+        &resp.order_id,
+    ));
     dash.lock().unwrap().triggers.push(TrigSummary {
         ts_iso: now_utc.to_rfc3339(),
         window_start: w_start,
@@ -1225,5 +1314,129 @@ mod tests {
         ] {
             assert!(!is_dashboard_trigger(Some(o)), "{o:?} must not count");
         }
+    }
+
+    // a simple-fill record: paper entry 0.64, fresh ask 0.66, filled 7 @ 0.70, no re-quote
+    fn fill_rec() -> LiveTriggerRecord {
+        build_fill_record(
+            Outcome::Filled,
+            1.0,
+            "2026-06-28T12:00:00+00:00".into(),
+            "2026-06-28T11:45:00+00:00".into(),
+            "2026-06-28T12:00:00+00:00".into(),
+            "KXBTC15M-26JUN281145-45".into(),
+            "yes",
+            0.64, // signal_entry
+            0.66, // orderbook_entry
+            Some(0.73),
+            113.34,
+            0.66,  // exec_entry
+            0.72,  // first_limit_price
+            false, // requote
+            None,  // requote_limit_price
+            0,     // remaining_count
+            7.0,   // fill
+            0.70,  // eff
+            0.0147,
+            119,
+            "ord-1",
+        )
+    }
+
+    #[test]
+    fn build_fill_record_full_decomposition() {
+        let v: serde_json::Value = serde_json::to_value(fill_rec()).unwrap();
+        // legacy `entry` key carries eff; signal_entry is the paper price
+        assert_eq!(v["entry"], 0.70);
+        assert_eq!(v["signal_entry"], 0.64);
+        assert_eq!(v["exec_entry"], 0.66);
+        assert_eq!(v["orderbook_entry"], 0.66);
+        assert_eq!(v["first_limit_price"], 0.72);
+        assert_eq!(v["requote"], false);
+        assert_eq!(v["fill"], 7.0);
+        assert_eq!(v["count"], 7);
+        assert_eq!(v["latency_ms"], 119);
+        assert_eq!(v["order_id"], "ord-1");
+        // gap is computable offline: gap = eff - signal_entry, drift + walk == gap
+        let (gap, drift, walk) = decompose_gap(0.64, 0.66, 0.70);
+        assert!((gap - 0.06).abs() < 1e-9);
+        assert!((drift + walk - gap).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_fill_record_back_compat_keys() {
+        let s = serde_json::to_string(&fill_rec()).unwrap();
+        assert!(s.contains("\"kind\":\"trigger\""));
+        assert!(s.contains("\"live\":true"));
+        assert!(s.contains("\"outcome\":\"filled\""));
+        // the resolver/dashboard read entry/side/count/delta_from_open — all present
+        assert!(s.contains("\"entry\":0.7"));
+        assert!(s.contains("\"side\":\"yes\""));
+    }
+
+    #[test]
+    fn build_fill_record_partial_count_is_fill() {
+        let mut r = fill_rec();
+        r = build_fill_record(
+            Outcome::Partial,
+            r.ts,
+            r.ts_iso.clone(),
+            r.window_start.clone(),
+            r.window_end.clone(),
+            r.market_ticker.clone(),
+            "yes",
+            0.64,
+            0.66,
+            Some(0.73),
+            113.34,
+            0.66,
+            0.72,
+            false,
+            None,
+            3, // remaining_count > 0
+            4.0, // fill
+            0.70,
+            0.01,
+            119,
+            "ord-2",
+        );
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["outcome"], "partial");
+        assert_eq!(v["remaining_count"], 3);
+        assert_eq!(v["count"], 4); // count == fill as i64
+    }
+
+    #[test]
+    fn build_fill_record_requote_has_both_prices() {
+        let r = build_fill_record(
+            Outcome::Filled,
+            1.0,
+            "t".into(),
+            "ws".into(),
+            "we".into(),
+            "tkr".into(),
+            "no",
+            0.55,
+            0.55,
+            None,
+            -90.0,
+            0.58,
+            0.36,       // first limit (NO side)
+            true,       // requote
+            Some(0.30), // requote limit
+            0,
+            8.0,
+            0.62,
+            0.015,
+            300,
+            "",
+        );
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["requote"], true);
+        assert_eq!(v["first_limit_price"], 0.36);
+        assert_eq!(v["requote_limit_price"], 0.30);
+        assert_ne!(v["first_limit_price"], v["requote_limit_price"]);
+        // empty order_id is omitted, not written as ""
+        assert!(v.get("order_id").is_none());
     }
 }
