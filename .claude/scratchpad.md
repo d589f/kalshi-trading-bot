@@ -2,7 +2,7 @@
 
 ## Branch: feat/live-exec-telemetry-latch-fix
 
-## Status: 2026-06-29. P0b (latch fix) DONE on branch (283ef53), tested, NOT yet deployed. Live max_entry 0.92, loss-stop $100.
+## Status: 2026-06-29 ~11:30 UTC. P0b DEPLOYED to prod (PID 1513873). Pushed to main both repos (92c23e0) + DAILY_2026-06-29.md. total_pnl ~-$74 (day still soft). Watching first orders for runaway/retry.
 
 ## P0b done (slice 6, commit 283ef53): latch on fill, retry no-fills (RETRY_MAX_ATTEMPTS=2, RETRY_COOLDOWN_SECS=3.0; N=1/C=0=legacy). Fixes the 17-no-fill-burns-window leak. 33 tests pass. Real-money behavior change — deploy = rebuild+restart, then watch for runaway ordering (bounded: max 2 place_live/window).
 ## Root-cause reconciliation (2026-06-29): live ≈ paper on matched trades (100% same outcomes). The -$65 = near-breakeven WR window (71% vs ~72-74% breakeven) + Kalshi fee -$24 (per-contract 0.07*C*P*(1-P), confirmed official) + live missed ~28% of paper trades, but most misses were TRANSIENT (my ~10 deploy restarts + the now-reverted max_entry cap + daily caps), only 17 were no-fills (the latch, now fixed). Green dashboard line = real paper engine (not backtest), $100 NO-fee; +$4191 was earned mostly Jun22-25 BEFORE live. Over live's window paper was ~flat (+$3.90 net@$5 w/fee). EDGE not dead — thin: net +2.6%/trade only if WR>=74%. TRIPWIRE: 1 week data, WR>=74% keep / <73% stop.
