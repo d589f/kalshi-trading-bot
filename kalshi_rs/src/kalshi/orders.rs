@@ -26,6 +26,9 @@ struct V2Order<'a> {
     time_in_force: &'a str,
     self_trade_prevention_type: &'a str,
     client_order_id: String,
+    /// subaccount number to route this order to (0 = primary). Lets us isolate the live
+    /// bot on a funded subaccount instead of the main balance.
+    subaccount: u32,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -61,10 +64,12 @@ pub struct OrderClient {
     base: String,
     http: reqwest::Client,
     signer: Signer,
+    /// subaccount all orders are routed to (0 = primary). Set from the SUBACCOUNT env.
+    subaccount: u32,
 }
 
 impl OrderClient {
-    pub fn new(base: impl Into<String>, signer: Signer) -> Result<Self> {
+    pub fn new(base: impl Into<String>, signer: Signer, subaccount: u32) -> Result<Self> {
         // Orders fire ~once/15min — far past the idle window — so a cold order pays a fresh
         // TCP+TLS handshake (~280ms vs ~105ms warm, measured EU→Kalshi). HTTP/2 holds ONE
         // multiplexed connection per host, kept alive by PING frames even while idle, so the
@@ -82,6 +87,7 @@ impl OrderClient {
             base: base.into(),
             http,
             signer,
+            subaccount,
         })
     }
 
@@ -110,6 +116,7 @@ impl OrderClient {
             time_in_force: "immediate_or_cancel",
             self_trade_prevention_type: "taker_at_cross",
             client_order_id,
+            subaccount: self.subaccount,
         };
         let url = format!("{}/portfolio/events/orders", self.base);
         let rb = self.signed(self.http.post(&url).json(&body), "POST", "/trade-api/v2/portfolio/events/orders");

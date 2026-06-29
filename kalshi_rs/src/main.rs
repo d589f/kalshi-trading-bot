@@ -463,14 +463,17 @@ async fn main() -> Result<()> {
             info!("total real PnL (all-time, from ledger): ${:+.2}", s.total_pnl);
         }
     }
+    // Route live orders to this subaccount (0 = primary). Set SUBACCOUNT=1 to isolate the bot
+    // on a funded subaccount instead of the main balance.
+    let subaccount = env_i64("SUBACCOUNT", 0).max(0) as u32;
     let order_client: Option<Arc<OrderClient>> =
         match (std::env::var("KALSHI_KEY_ID"), std::env::var("KALSHI_KEY_PATH")) {
             (Ok(kid), Ok(kpath)) => match std::fs::read_to_string(&kpath) {
-                Ok(pem) => match Signer::from_pem(kid, &pem).and_then(|s| OrderClient::new(base.clone(), s)) {
+                Ok(pem) => match Signer::from_pem(kid, &pem).and_then(|s| OrderClient::new(base.clone(), s, subaccount)) {
                     Ok(oc) => {
                         info!(
-                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${}",
-                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop
+                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${} subaccount={}",
+                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop, subaccount
                         );
                         Some(Arc::new(oc))
                     }
