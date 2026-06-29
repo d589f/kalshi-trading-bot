@@ -2,7 +2,38 @@
 
 ## Branch: feat/live-exec-telemetry-latch-fix
 
-## Status: P0 telemetry DEPLOYED TO PROD (slices 1-5) — HARD STOP before slice 6 (P0b, real-money) per user
+## Status: 2026-06-29. P0b (latch fix) DONE on branch (283ef53), tested, NOT yet deployed. Live max_entry 0.92, loss-stop $100.
+
+## P0b done (slice 6, commit 283ef53): latch on fill, retry no-fills (RETRY_MAX_ATTEMPTS=2, RETRY_COOLDOWN_SECS=3.0; N=1/C=0=legacy). Fixes the 17-no-fill-burns-window leak. 33 tests pass. Real-money behavior change — deploy = rebuild+restart, then watch for runaway ordering (bounded: max 2 place_live/window).
+## Root-cause reconciliation (2026-06-29): live ≈ paper on matched trades (100% same outcomes). The -$65 = near-breakeven WR window (71% vs ~72-74% breakeven) + Kalshi fee -$24 (per-contract 0.07*C*P*(1-P), confirmed official) + live missed ~28% of paper trades, but most misses were TRANSIENT (my ~10 deploy restarts + the now-reverted max_entry cap + daily caps), only 17 were no-fills (the latch, now fixed). Green dashboard line = real paper engine (not backtest), $100 NO-fee; +$4191 was earned mostly Jun22-25 BEFORE live. Over live's window paper was ~flat (+$3.90 net@$5 w/fee). EDGE not dead — thin: net +2.6%/trade only if WR>=74%. TRIPWIRE: 1 week data, WR>=74% keep / <73% stop.
+
+## MORNING FINDINGS (2026-06-29) — overnight was bad
+- total_pnl -$65.66 (lost ~$26 overnight). Live overnight: 34 trades, WR 65%, -$25.83.
+- http2 FAILED to fix latency: 46% of fills still cold ~280-477ms (warm ones hit the ~105ms floor). mean 215 vs ~250 before = marginal. Only us-east COLOCATION fixes latency.
+- WR DECAY trend: backtest 78% -> live recent 71% -> overnight 65%. PAPER also fell to 69% overnight (paper LOST too) -> it's the EDGE decaying, not just execution. (DAILY warned edge decays.)
+- max_entry 0.85 BACKFIRED: paper's expensive trades (>0.85) that live skipped won 91% & were profitable; cheap trades (<=0.85) live kept won only 61%. So the cap removed the winners. REVERTED to 0.92.
+- USER DECISION: keep live running (bet WR recovers), revert max_entry to 0.92. Done.
+- TRIPWIRE to watch: if total approaches -$100+ or WR stays <70% another day, recommend pause. Real options: retrain/find new edge, colocation for latency, or accept decay & stop.
+
+## (prior) OVERNIGHT HANDOFF (deployed to prod, EU box kalshi-shadow-com)
+
+## OVERNIGHT HANDOFF (deployed to prod, EU box kalshi-shadow-com)
+Live config NOW: LIVE_TRADING=1, STAKE=5, MAX_ENTRY=0.85 (paper stays 0.92 for A/B),
+PRICE_BUF=0.06, DAILY_LOSS_STOP=100 (raised from 50 per user — wants room for reversal),
+MAX_TRADES_DAY=96. Binary = P0 telemetry + keep-warm + HTTP/2 (h2 keepalive) + MAX_ENTRY override.
+PnL at handoff: total -$39.83, today -$18.97 / 81 trades. Pushed to main (Peanut-PM + d589f) up to 68c71a7 (+ later commits 955a9f6/d78c528/68c71a7 on branch; main was merged at 4236cda, later commits may be branch-only — CHECK before next push).
+
+OPEN ITEMS for morning:
+1. http2 latency: only 1 post-restart fill (150ms) — need 3-4 to confirm the ~300ms cold tail is gone (warm floor ~105ms). Query ledger fills after restart. If still ~300 → only colocation (us-east) fixes it.
+2. max_entry 0.85 effect: compare live(0.85) vs paper(0.92) head-to-head; skip_band rows in ledger = the expensive trades live now skips — did paper win/lose on them?
+3. WR question: backtest 6-wk WR 78.5% (strong edge, robust train/test); live recent 71% (within noise of 77% but low). Is it noise or decay? Overnight data helps.
+4. Backtest sweep (kalshi_third/sweep.py): later entry (em=5-6 ~300-360s) > current 270s; delta threshold barely matters; lower max_entry better EV/trade; p-gate marginal. BUT idealized fills — backtest +5-11% net while live negative; gap is mostly WR(period) + slippage. Don't act on absolute numbers.
+
+NOT done: slice 6 (P0b latch fix) — still pending, latch-burns-window bug remains on prod (minor: no-fill burns the window). Plan in .claude/plan-live-exec-telemetry-latch-fix.md.
+
+Prod access: ssh dmitrii@34.32.177.126 (key in session scratchpad eu_key), sudo ok. Backups of every deploy: *.bak.TIMESTAMP on box. Backtest harness: kalshi_third/kalshi_third_bt.py (run()), sweep.py.
+
+## (prior) Status: P0 telemetry DEPLOYED TO PROD (slices 1-5)
 
 ## Deploy note (2026-06-28 ~15:20 UTC)
 P0 telemetry live on EU box (kalshi-shadow-com, PID 465625, new binary built on-box 8m18s).
@@ -45,7 +76,10 @@ OrderClient had its own pool, orders fire ~once/15min > reqwest ~90s idle → co
 Fix: pool_idle_timeout(None) + tcp_keepalive(30s) on OrderClient; main.rs spawns a warm-ping
 (GET /portfolio/balance every ORDER_WARM_SECS=30) so the order POST is ~1 RTT. Behavior-neutral.
 Validation = OPERATIONAL: watch latency_ms in new ledger fills drop from ~250 toward ~100-150.
-DEPLOY in progress: backups ts 20260628-220447. (rebuild ~8min on-box + restart.)
+DEPLOYED 2026-06-28 ~19:15 UTC (box time): rebuilt on-box (9m46s), restarted, PID 664400.
+Startup log confirms "order connection keep-warm every 30s (GET /portfolio/balance)", no ping failures.
+Backups ts 20260628-220447 (binary + main.rs + orders.rs) for rollback. Watching next fills' latency_ms
+to confirm drop from ~250 → ~100-150. Pushed to main on both Peanut-PM + d589f (4236cda).
 
 ## Notes
 - 27 tests pass; clippy clean on new code; pricing/sizing/order-send byte-identical (P0 = telemetry only).
