@@ -136,6 +136,25 @@ pub(crate) fn is_dashboard_trigger(outcome: Option<Outcome>) -> bool {
     outcome.is_none_or(|o| o.is_position())
 }
 
+/// P0b retry policy. A no-fill / order-error / rejected is a *retryable* miss — it consumes a
+/// bounded attempt but does NOT latch the window. Everything else (filled, partial, or a
+/// deliberate skip) latches the window so we never re-fire it (and skips never spam).
+pub(crate) fn counts_as_attempt(o: Outcome) -> bool {
+    matches!(o, Outcome::Nofill | Outcome::OrderError | Outcome::Rejected)
+}
+
+/// Latch the window on any non-retryable outcome (filled/partial = got a position; skip_* =
+/// a deliberate no-trade). The window is NOT latched on a retryable miss, so it can re-attempt.
+pub(crate) fn latch_decision(o: Outcome) -> bool {
+    !counts_as_attempt(o)
+}
+
+/// May we place another live attempt this window? Bounded by max attempts and a cooldown since
+/// the last attempt. A backwards clock (`now < last`) yields false (stay in the safe direction).
+pub(crate) fn retry_gate(attempt_count: i64, last_attempt_ts: f64, now: f64, n: i64, c: f64) -> bool {
+    attempt_count < n && (now - last_attempt_ts) >= c
+}
+
 /// Build the typed fill/partial ledger record from `place_live`'s fill-path locals.
 /// The legacy JSON `entry` key carries `eff` (resolver/dashboard read it); the paper/signal
 /// entry goes into the additive `signal_entry` field so `gap = eff - signal_entry`.
@@ -322,6 +341,10 @@ struct LiveCfg {
     /// on a no-fill, re-quote ONE deeper IOC at entry±requote_buf to catch a moved book.
     /// Applies only to the failed order (normal fills keep price_buf). 0 disables re-quote.
     requote_buf: f64,
+    /// P0b: a no-fill no longer burns the window — retry up to this many attempts/window,
+    /// spaced by retry_cooldown_secs. retry_max_attempts=1 + cooldown=0 == legacy (one shot).
+    retry_max_attempts: i64,
+    retry_cooldown_secs: f64,
 }
 
 /// MIRROR config (env). When `url` is set, the f6 signal is taken straight from the
@@ -418,6 +441,8 @@ async fn main() -> Result<()> {
         max_count: env_i64("MAX_COUNT", 15),
         price_buf: env_f64("PRICE_BUF", 0.02),
         requote_buf: env_f64("REQUOTE_BUF", 0.12),
+        retry_max_attempts: env_i64("RETRY_MAX_ATTEMPTS", 2),
+        retry_cooldown_secs: env_f64("RETRY_COOLDOWN_SECS", 3.0),
     };
     // MIRROR: take the signal from the paper engine (1:1). Off unless MIRROR_STATE_URL set.
     let mcfg = MirrorCfg {
@@ -776,6 +801,10 @@ async fn signal_loop(
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     let mut fired_window: Option<String> = None;
     let mut last_status_log = 0.0f64;
+    // P0b per-window retry state (reset when the window rolls).
+    let mut attempt_window: Option<String> = None;
+    let mut attempt_count: i64 = 0;
+    let mut last_attempt_ts: f64 = f64::NEG_INFINITY;
 
     loop {
         tick.tick().await;
@@ -969,31 +998,51 @@ async fn signal_loop(
             l.updated_iso = now_utc.to_rfc3339();
         }
 
-        // ---- trigger → emit would-be order (once per window) ----
+        // ---- trigger → place a live order. P0b: latch the window only on a non-retryable
+        //      outcome (a fill, or a deliberate skip); a no-fill/error re-attempts within the
+        //      window (bounded by retry_max_attempts + cooldown) instead of burning it. ----
         if let Some(fire) = res.fire {
+            // reset per-window retry state when the window rolls
+            if attempt_window.as_deref() != win_key.as_deref() {
+                attempt_window = win_key.clone();
+                attempt_count = 0;
+                last_attempt_ts = f64::NEG_INFINITY;
+            }
             let already = fired_window.as_deref() == win_key.as_deref();
-            if !already {
-                if book.ticker.is_empty() {
-                    // no market yet — don't latch; wait for the poller
-                } else if lcfg.enabled && order_client.is_some() {
-                    fired_window = win_key.clone();
-                    place_live(
-                        order_client.as_ref().unwrap(),
-                        &lcfg,
-                        &live_state,
-                        &ledger,
-                        &pending,
-                        &dash,
-                        &cfg,
-                        &shared,
-                        &book,
-                        &win,
-                        &fire,
+            if !already && !book.ticker.is_empty() {
+                if lcfg.enabled && order_client.is_some() {
+                    if retry_gate(
+                        attempt_count,
+                        last_attempt_ts,
                         now,
-                        now_utc,
-                        &rest,
-                    )
-                    .await;
+                        lcfg.retry_max_attempts,
+                        lcfg.retry_cooldown_secs,
+                    ) {
+                        last_attempt_ts = now;
+                        let outcome = place_live(
+                            order_client.as_ref().unwrap(),
+                            &lcfg,
+                            &live_state,
+                            &ledger,
+                            &pending,
+                            &dash,
+                            &cfg,
+                            &shared,
+                            &book,
+                            &win,
+                            &fire,
+                            now,
+                            now_utc,
+                            &rest,
+                        )
+                        .await;
+                        if counts_as_attempt(outcome) {
+                            attempt_count += 1;
+                        }
+                        if latch_decision(outcome) {
+                            fired_window = win_key.clone();
+                        }
+                    }
                 } else {
                     fired_window = win_key.clone();
                     emit_trigger(&ledger, &pending, &cfg, &shared, &book, &win, &fire, now, now_utc, &dash);
@@ -1730,5 +1779,93 @@ mod tests {
         assert_eq!(resolve_max_entry(0.92, Some("1.5".into())), 0.92); // > 0.99 -> default
         assert_eq!(resolve_max_entry(0.92, Some("0.40".into())), 0.92); // <= 0.5 -> default
         assert_eq!(resolve_max_entry(0.92, Some("0.99".into())), 0.99); // upper edge ok
+    }
+
+    // ---- P0b: latch / retry ----
+    #[test]
+    fn counts_as_attempt_and_latch_tables() {
+        for o in [Outcome::Nofill, Outcome::OrderError, Outcome::Rejected] {
+            assert!(counts_as_attempt(o), "{o:?} is a retryable attempt");
+            assert!(!latch_decision(o), "{o:?} must NOT latch (so it can retry)");
+        }
+        for o in [
+            Outcome::Filled,
+            Outcome::Partial,
+            Outcome::SkipDailyCap,
+            Outcome::SkipLossStop,
+            Outcome::SkipBand,
+        ] {
+            assert!(!counts_as_attempt(o), "{o:?} is not a retry");
+            assert!(latch_decision(o), "{o:?} latches the window");
+        }
+    }
+
+    #[test]
+    fn retry_gate_budget_and_cooldown() {
+        // budget: blocked once attempt_count reaches n
+        assert!(retry_gate(0, f64::NEG_INFINITY, 1.0, 2, 3.0));
+        assert!(!retry_gate(2, 0.0, 100.0, 2, 3.0)); // exhausted
+        // cooldown: must wait c seconds since last attempt
+        assert!(!retry_gate(1, 10.0, 10.3, 2, 3.0)); // 0.3s < 3s
+        assert!(retry_gate(1, 10.0, 13.0, 2, 3.0)); // 3.0s == c, inclusive
+        // backwards clock -> false (safe)
+        assert!(!retry_gate(0, 10.0, 9.0, 2, 3.0));
+        // c==0 -> always passes on the time axis
+        assert!(retry_gate(0, 5.0, 5.0, 1, 0.0));
+    }
+
+    /// Simulate one window's order loop using only the pure helpers (mirrors signal_loop).
+    /// `outcomes[k]` is what the k-th placed order returns. Returns (orders_placed, latched).
+    fn sim_window(outcomes: &[Outcome], n: i64, c: f64) -> (usize, bool) {
+        let mut attempt_count = 0i64;
+        let mut last_attempt_ts = f64::NEG_INFINITY;
+        let mut latched = false;
+        let mut placed = 0usize;
+        let mut now = 0.0;
+        for _ in 0..60 {
+            // ~18s of 0.3s ticks
+            now += 0.3;
+            if latched {
+                break;
+            }
+            if retry_gate(attempt_count, last_attempt_ts, now, n, c) {
+                last_attempt_ts = now;
+                let o = outcomes[placed.min(outcomes.len() - 1)];
+                placed += 1;
+                if counts_as_attempt(o) {
+                    attempt_count += 1;
+                }
+                if latch_decision(o) {
+                    latched = true;
+                }
+            }
+        }
+        (placed, latched)
+    }
+
+    #[test]
+    fn retry_sequence_default_n2() {
+        // immediate fill -> 1 order, latched
+        assert_eq!(sim_window(&[Outcome::Filled], 2, 3.0), (1, true));
+        // no-fill then fill -> 2 orders, latched (the bug fix: window NOT burned on no-fill)
+        assert_eq!(sim_window(&[Outcome::Nofill, Outcome::Filled], 2, 3.0), (2, true));
+        // two no-fills -> 2 attempts then exhausted, never latched, no 3rd order
+        assert_eq!(sim_window(&[Outcome::Nofill, Outcome::Nofill], 2, 3.0), (2, false));
+        // a skip latches immediately (no retry spam)
+        assert_eq!(sim_window(&[Outcome::SkipDailyCap], 2, 3.0), (1, true));
+        assert_eq!(sim_window(&[Outcome::SkipBand], 2, 3.0), (1, true));
+    }
+
+    #[test]
+    fn nfr4_n1_c0_equals_legacy() {
+        // N=1, C=0 == today's one-shot-per-window: a no-fill never retries.
+        assert_eq!(sim_window(&[Outcome::Nofill, Outcome::Filled], 1, 0.0), (1, false));
+        assert_eq!(sim_window(&[Outcome::Filled], 1, 0.0), (1, true));
+    }
+
+    #[test]
+    fn at_most_one_fill_per_window() {
+        // even if place_live could be called again, a fill latches and stops further orders
+        assert_eq!(sim_window(&[Outcome::Filled, Outcome::Filled], 5, 0.0), (1, true));
     }
 }
