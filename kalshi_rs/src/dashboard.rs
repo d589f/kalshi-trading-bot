@@ -478,7 +478,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=grid id=realpnl></div>
 <div class=grid id=match></div>
 <div class=grid id=live></div>
-<h1>Real cumulative PnL <span class=dim>(actual $5 money, all fees + slippage included)</span>: <span class=yellow>paper $5-twin</span> vs <span class=green>LIVE real</span> <span id=chartlbl class=dim></span></h1>
+<h1>Cumulative PnL <span class=dim>(uniform $5, all fees + slippage included)</span>: <span class=yellow>paper $5-twin</span> vs <span class=green>LIVE/shadow @ $5</span> <span id=chartlbl class=dim></span></h1>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
 <div id=tip class=tip></div>
@@ -570,7 +570,10 @@ function renderTip(r){
  let h=`<h4>окно ${wt} <span class=mk>${tkr}</span></h4>`;
  const cnt=r.com_count?` ${r.com_count}×`:'';
  const lres=r.com_result||(r.com_won===true?'WIN':r.com_won===false?'LOSS':null);
- h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,r.com_pnl,lres,'');
+ // show the $5-normalized pnl (twin5 on the fill entry), not raw com_pnl which may be a $100 shadow row
+ const ltw=(r.com_pnl!=null&&r.com_entry)?twin5(r.com_entry,(r.com_won!=null?r.com_won:r.com_pnl>0)):r.com_pnl;
+ const lnote=(r.com_pnl!=null&&Math.abs(r.com_pnl-ltw)>0.5)?` <span class=lbl>(raw $100-shadow ${r.com_pnl>=0?'+':''}${f(r.com_pnl,0)})</span>`:'';
+ h+=tseg('🟢 LIVE $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,ltw,lres,lnote);
  const ptw=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
  const pnote=ptw!=null?` <span class=lbl>(orig $100-model ${r.pa_pnl>=0?'+':''}${f(r.pa_pnl,0)})</span>`:'';
  h+=tseg('📄 PAPER $5-twin',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,ptw,r.pa_result,pnote);
@@ -582,7 +585,14 @@ function updateChart(cmp){
  if(typeof LightweightCharts==='undefined'){return}
  if(!_chart) initChart();
  _cmp=cmp;
- for(const r of cmp){ r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null; }
+ // BOTH lines normalized to $5: paper via twin5, and shadow/LIVE ALSO via twin5 on its own
+ // fill entry (com_entry) — NOT raw com_pnl. The bot's shadow path (emit_trigger) sizes at
+ // cfg.stake=$100 while live fills size at $5, so raw com_pnl silently mixes $5 and $100 rows;
+ // twin5(com_entry,won) re-prices every row at a uniform $5 so the curve is apples-to-apples.
+ for(const r of cmp){
+  r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
+  r.com_twin=(r.com_pnl!=null&&r.com_entry)?twin5(r.com_entry,(r.com_won!=null?r.com_won:r.com_pnl>0)):null;
+ }
  const rows=cmp.slice().reverse();
  // gate=true would accumulate only on both-resolved windows; we plot ungated full history.
  const build=(k,sc,gate)=>{sc=sc||1;let t=0;const out=[];let last=null;for(const r of rows){const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue; const both=(r.pa_pnl!=null&&r.com_pnl!=null); if(r[k]!=null&&(!gate||both))t+=r[k]*sc; if(ts!==last){out.push({time:ts,value:+t.toFixed(2)});last=ts;}else if(out.length){out[out.length-1].value=+t.toFixed(2);}} return out;};
@@ -590,13 +600,12 @@ function updateChart(cmp){
  // FULL history (ungated): every trade is its own step on each line, so all paper
  // losses show and the curve never goes flat just because the other side no-filled.
  // The no-fill coverage gap is now visible (paper pulls ahead where LIVE missed a fill).
- // paper plotted as its $5 Kalshi-twin (×20) so it runs IDENTICAL economics to LIVE —
- // the remaining paper-vs-LIVE gap is then only real slippage + no-fills, not accounting.
- // REAL $5 dollars — no ×20. Both lines run identical $5 Kalshi economics (integer contracts,
- // Kalshi fee on win+loss, loss=-cost), so the gap = real slippage + no-fills. US shadow dropped.
- _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_pnl'));
+ // Both lines run identical $5 Kalshi economics (integer contracts, Kalshi fee on win+loss,
+ // loss=-cost) via twin5 on each side's own fill entry, so the remaining paper-vs-LIVE gap is
+ // ONLY real slippage + no-fills, never a stake-scale artifact. US shadow dropped.
+ _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin'));
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length;
- document.getElementById('chartlbl').textContent=`(real $5 · paper-twin ${money(tot('pa_twin'))} over ${paw}w  vs  LIVE ${money(tot('com_pnl'))} over ${cow}w · gap = slippage + no-fills · authoritative total → cards above)`;
+ document.getElementById('chartlbl').textContent=`(uniform $5 · paper-twin ${money(tot('pa_twin'))} over ${paw}w  vs  LIVE/shadow ${money(tot('com_twin'))} over ${cow}w · gap = slippage + no-fills · real-money total → cards above)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
@@ -607,7 +616,7 @@ async function load(){
  // ===== authoritative REAL money (pushed from the bot, fees+slippage in) + period paper-vs-live =====
  const lc=d.live_com||{};
  let pT=0,pL=0,nL=0,wL=0;
- for(const c of d.compare){ if(c.pa_pnl!=null&&c.pa_entry){pT+=twin5(c.pa_entry,c.pa_pnl>0);} if(c.com_pnl!=null){pL+=c.com_pnl;nL++;if(c.com_pnl>0)wL++;} }
+ for(const c of d.compare){ if(c.pa_pnl!=null&&c.pa_entry){pT+=twin5(c.pa_entry,c.pa_pnl>0);} if(c.com_pnl!=null&&c.com_entry){pL+=twin5(c.com_entry,(c.com_won!=null?c.com_won:c.com_pnl>0));nL++;if(c.com_pnl>0)wL++;} }
  const edge=pT!=0?Math.round(100*pL/pT):0;
  document.getElementById('realpnl').innerHTML=
    card('💵 LIVE real · ALL-TIME',money(lc.total_pnl),rc(lc.total_pnl),true)
