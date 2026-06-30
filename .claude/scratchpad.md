@@ -2,7 +2,9 @@
 
 ## Branch: feat/live-exec-telemetry-latch-fix
 
-## Status: 2026-06-29 ~12:15 UTC. LIVE ISOLATED ON SUBACCOUNT #1 ($200). Pushed to main both repos (61d87ef).
+## Status: 2026-06-30. LIVE TRADING STOPPED (LIVE_TRADING=0, per user) — final real PnL -$131.30. Shadow/paper continue.
+## Decision: edge is thin/regime-dependent & currently losing (analysis: Δ>=80 keeps a tiny +$8 recent w/ CI excl 0, but Δ>=20 loses -$43 recent; entry deviation only -$13, fee -$130 is the big cost; +$4191 paper was a hot streak Jun21-23 before live). $200 parked in subaccount #1 (idle now). Open: move $200 back 1->0? fully stop shadow service? shadow-test Δ>=80?
+## (prior) Status: 2026-06-29 ~12:15 UTC. LIVE ISOLATED ON SUBACCOUNT #1 ($200). Pushed to main both repos (61d87ef).
 ## Live config now: SUBACCOUNT=1 (verified — order debited #1, acct 0 untouched), max_entry 0.92, loss_stop $100, P0b+http2+telemetry, PID 1548004. Subaccount #1 funded $200 (2 transfers from 0). total real PnL ~-$75 (on acct 0, pre-switch). ⚠️ loss-stop $100 on $200=50%/day — recommend tightening (user left $100). Subaccount endpoints: GET /portfolio/subaccounts/balances, POST /portfolio/subaccounts/transfer; order body field `subaccount`. Signing via python+cryptography on box (key /home/dmitrii/.kalshi_live.pem). TRIPWIRE still: WR>=74% keep / <73% stop.
 
 ## P0b done (slice 6, commit 283ef53): latch on fill, retry no-fills (RETRY_MAX_ATTEMPTS=2, RETRY_COOLDOWN_SECS=3.0; N=1/C=0=legacy). Fixes the 17-no-fill-burns-window leak. 33 tests pass. Real-money behavior change — deploy = rebuild+restart, then watch for runaway ordering (bounded: max 2 place_live/window).
