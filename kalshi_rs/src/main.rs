@@ -576,6 +576,12 @@ async fn main() -> Result<()> {
     if let Some(w) = &session_warn {
         error!("{w}");
     }
+    // Execution anchor (EXEC_ANCHOR env; default ask = legacy fresh-ask pricing).
+    let anchor_env = std::env::var("EXEC_ANCHOR").ok();
+    let (exec_anchor, anchor_warn) = select_exec_anchor(anchor_env.as_deref());
+    if let Some(w) = &anchor_warn {
+        error!("{w}");
+    }
     let mut cfg = session_sel.config();
     cfg.max_entry_price = resolve_max_entry(cfg.max_entry_price, std::env::var("MAX_ENTRY").ok());
     info!(
@@ -656,8 +662,8 @@ async fn main() -> Result<()> {
                 Ok(pem) => match Signer::from_pem(kid, &pem).and_then(|s| OrderClient::new(base.clone(), s, subaccount)) {
                     Ok(oc) => {
                         info!(
-                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${} subaccount={}",
-                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop, subaccount
+                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${} subaccount={} exec_anchor={:?}",
+                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop, subaccount, exec_anchor
                         );
                         Some(Arc::new(oc))
                     }
@@ -808,7 +814,7 @@ async fn main() -> Result<()> {
     // 4) Signal loop @ 0.3s
     signal_loop(
         state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http, rest,
-        session_sel,
+        session_sel, exec_anchor,
     )
     .await;
     Ok(())
@@ -1002,6 +1008,7 @@ async fn signal_loop(
     http: reqwest::Client,
     rest: Arc<KalshiRest>,
     sel: SessionSel,
+    anchor: ExecAnchor,
 ) {
     let session_tag = sel.session_tag();
     // The REFERENCE SHADOW: the f6 strategy is always evaluated alongside the selected
@@ -1300,6 +1307,7 @@ async fn signal_loop(
                             now_utc,
                             &rest,
                             sel,
+                            anchor,
                         )
                         .await;
                         if counts_as_attempt(outcome) {
@@ -1440,6 +1448,7 @@ async fn place_live(
     now_utc: DateTime<Utc>,
     rest: &KalshiRest,
     sel: SessionSel,
+    anchor: ExecAnchor,
 ) -> Outcome {
     let session_tag = sel.session_tag();
     let side_str: &'static str = match fire.side {
@@ -1503,81 +1512,128 @@ async fn place_live(
         ledger.append(&ctx(Outcome::SkipBand));
         return Outcome::SkipBand;
     }
-    // FRESH orderbook at order time: size + price off the CURRENT real ask (not the ~0.5s-old
-    // mirrored paper ask). Gate/coverage stay on the signal entry (1:1 with paper), but execution
-    // runs on the live book so the IOC crosses the current ask — deploys exactly $5 (no over-size)
-    // and fills first-try (no deep re-quote overshoot). Falls back to the signal entry on any error.
-    let exec_entry = match rest.get_orderbook(&book.ticker, 10).await {
-        Ok(raw) => {
-            let fb = KalshiBook::derive(&book.ticker, &raw, None, now);
-            let a = match fire.side {
-                Side::Yes => fb.yes_ask,
-                Side::No => fb.no_ask,
-            };
-            a.filter(|v| *v > 0.50 && *v <= 0.98).unwrap_or(entry)
-        }
-        Err(_) => entry,
-    };
-    let (v2side, mut price) = match fire.side {
-        Side::Yes => ("bid", (exec_entry + lcfg.price_buf).min(0.99)),
-        Side::No => ("ask", ((1.0 - exec_entry) - lcfg.price_buf).max(0.01)),
-    };
-    // telemetry-only: capture the first limit BEFORE a possible re-quote overwrites `price`.
-    // These locals never feed `create_ioc`, so the order is byte-identical to before.
-    let first_limit_price = price;
-    let mut requoted = false;
-    let mut requote_limit_price: Option<f64> = None;
-    let mut count = (lcfg.stake / exec_entry).round();
-    if count < 1.0 {
-        count = 1.0;
-    }
-    if count > lcfg.max_count as f64 {
-        count = lcfg.max_count as f64;
-    }
     // coid prefix attributes the fill to the SELECTED strategy on Kalshi's side too
     let coid = format!("{}{}-{}", sel.coid_prefix(), now_utc.timestamp_millis(), side_str);
-    let (mut status, mut resp, mut lat) =
-        match oc.create_ioc(&book.ticker, v2side, count, price, coid.clone()).await {
-            Ok(x) => x,
-            Err(e) => {
-                warn!("LIVE order error: {e}");
-                let mut r = ctx(Outcome::OrderError);
-                r.exec_entry = Some(exec_entry);
-                r.first_limit_price = Some(first_limit_price);
-                ledger.append(&r);
-                return Outcome::OrderError;
+    let v2side = match fire.side {
+        Side::Yes => "bid",
+        Side::No => "ask",
+    };
+    // ---- execution fork (EXEC_ANCHOR): how the IOC limit is priced ----
+    // Each arm returns (exec_entry TELEMETRY Option, first_limit_price, requoted,
+    // requote_limit_price, count, final price, status, resp, lat) for the shared tail.
+    let (exec_entry, first_limit_price, requoted, requote_limit_price, count, price, status, resp, lat) = match anchor {
+        ExecAnchor::Ask => {
+            // LEGACY (verbatim): FRESH orderbook at order time — size + price off the CURRENT
+            // real ask (not the ~0.5s-old mirrored paper ask). Falls back to the signal entry
+            // on any error. Chases the ask; re-quote crosses deeper on a first no-fill.
+            let ee = match rest.get_orderbook(&book.ticker, 10).await {
+                Ok(raw) => {
+                    let fb = KalshiBook::derive(&book.ticker, &raw, None, now);
+                    let a = match fire.side {
+                        Side::Yes => fb.yes_ask,
+                        Side::No => fb.no_ask,
+                    };
+                    a.filter(|v| *v > 0.50 && *v <= 0.98).unwrap_or(entry)
+                }
+                Err(_) => entry,
+            };
+            let mut price = match fire.side {
+                Side::Yes => (ee + lcfg.price_buf).min(0.99),
+                Side::No => ((1.0 - ee) - lcfg.price_buf).max(0.01),
+            };
+            let first_limit_price = price;
+            let mut requoted = false;
+            let mut requote_limit_price: Option<f64> = None;
+            let mut count = (lcfg.stake / ee).round();
+            if count < 1.0 {
+                count = 1.0;
             }
-        };
-    // RE-QUOTE once on a no-fill: the book moved past our limit in the order RTT (fast/choppy
-    // window). Cross deeper — the aggressive price applies ONLY to the failed order, so normal
-    // fills keep the tight buffer. IOC still fills at the real ask (≤ limit), bounded by requote_buf.
-    if status == 201 && resp.fill() <= 0.0 && lcfg.requote_buf > lcfg.price_buf {
-        price = match fire.side {
-            Side::Yes => (exec_entry + lcfg.requote_buf).min(0.97),
-            Side::No => ((1.0 - exec_entry) - lcfg.requote_buf).max(0.03),
-        };
-        requoted = true;
-        requote_limit_price = Some(price);
-        info!(
-            "LIVE RE-QUOTE {} {} {}x @ {:.2} (1st no-fill → deeper cross)",
-            book.ticker,
-            side_str.to_uppercase(),
-            count,
-            price
-        );
-        if let Ok((s2, r2, l2)) = oc
-            .create_ioc(&book.ticker, v2side, count, price, format!("{coid}-rq"))
-            .await
-        {
-            status = s2;
-            resp = r2;
-            lat = l2;
+            if count > lcfg.max_count as f64 {
+                count = lcfg.max_count as f64;
+            }
+            let (mut status, mut resp, mut lat) =
+                match oc.create_ioc(&book.ticker, v2side, count, price, coid.clone()).await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!("LIVE order error: {e}");
+                        let mut r = ctx(Outcome::OrderError);
+                        r.exec_entry = Some(ee);
+                        r.first_limit_price = Some(first_limit_price);
+                        ledger.append(&r);
+                        return Outcome::OrderError;
+                    }
+                };
+            // RE-QUOTE once on a no-fill: the book moved past our limit in the order RTT.
+            // Cross deeper — bounded by requote_buf; applies only to the failed order.
+            if status == 201 && resp.fill() <= 0.0 && lcfg.requote_buf > lcfg.price_buf {
+                price = match fire.side {
+                    Side::Yes => (ee + lcfg.requote_buf).min(0.97),
+                    Side::No => ((1.0 - ee) - lcfg.requote_buf).max(0.03),
+                };
+                requoted = true;
+                requote_limit_price = Some(price);
+                info!(
+                    "LIVE RE-QUOTE {} {} {}x @ {:.2} (1st no-fill → deeper cross)",
+                    book.ticker,
+                    side_str.to_uppercase(),
+                    count,
+                    price
+                );
+                if let Ok((s2, r2, l2)) = oc
+                    .create_ioc(&book.ticker, v2side, count, price, format!("{coid}-rq"))
+                    .await
+                {
+                    status = s2;
+                    resp = r2;
+                    lat = l2;
+                }
+            }
+            (Some(ee), first_limit_price, requoted, requote_limit_price, count, price, status, resp, lat)
         }
-    }
+        ExecAnchor::Signal => {
+            // SIGNAL ANCHOR: limit = paper/signal price + crossing allowance; sizing off the
+            // signal too. NO pre-order book GET in the critical path — the order fires
+            // immediately (~150-250ms earlier than legacy); the book is fetched CONCURRENTLY,
+            // bounded to TELEMETRY_TIMEOUT_MS, purely for exec_entry telemetry (fail-open —
+            // its failure can never block, delay past the bound, or alter the order).
+            // NO re-quote (anti-chase): a P0b retry re-anchors at this same fixed limit.
+            let price = match fire.side {
+                Side::Yes => signal_yes_limit(entry, lcfg.price_buf),
+                Side::No => signal_no_limit(entry, lcfg.price_buf),
+            };
+            let count = signal_count(lcfg.stake, entry, lcfg.max_count);
+            let (order_res, book_res) = tokio::join!(
+                oc.create_ioc(&book.ticker, v2side, count, price, coid.clone()),
+                tokio::time::timeout(
+                    Duration::from_millis(TELEMETRY_TIMEOUT_MS),
+                    rest.get_orderbook(&book.ticker, 10),
+                ),
+            );
+            let exec_entry = book_res.ok().and_then(|r| r.ok()).and_then(|raw| {
+                let fb = KalshiBook::derive(&book.ticker, &raw, None, now);
+                filtered_ask(match fire.side {
+                    Side::Yes => fb.yes_ask,
+                    Side::No => fb.no_ask,
+                })
+            });
+            let (status, resp, lat) = match order_res {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!("LIVE order error: {e}");
+                    let mut r = ctx(Outcome::OrderError);
+                    r.exec_entry = exec_entry;
+                    r.first_limit_price = Some(price);
+                    ledger.append(&r);
+                    return Outcome::OrderError;
+                }
+            };
+            (exec_entry, price, false, None, count, price, status, resp, lat)
+        }
+    };
     if status != 201 {
         warn!("LIVE order rejected HTTP {}", status);
         let mut r = ctx(Outcome::Rejected);
-        r.exec_entry = Some(exec_entry);
+        r.exec_entry = exec_entry;
         r.first_limit_price = Some(first_limit_price);
         r.requote = Some(requoted);
         r.requote_limit_price = requote_limit_price;
@@ -1593,7 +1649,7 @@ async fn place_live(
         );
         let rem = resp.remaining_count.parse::<f64>().unwrap_or(0.0);
         let mut r = ctx(Outcome::Nofill);
-        r.exec_entry = Some(exec_entry);
+        r.exec_entry = exec_entry;
         r.first_limit_price = Some(first_limit_price);
         r.requote = Some(requoted);
         r.requote_limit_price = requote_limit_price;
@@ -1622,7 +1678,10 @@ async fn place_live(
     } else {
         Outcome::Filled
     };
-    ledger.append(&build_fill_record(
+    // build_fill_record signature is FROZEN (its 4 tests untouched): pass a concrete f64
+    // and overwrite with the true Option afterwards — ask mode is always Some (identical),
+    // signal mode may be None when the concurrent telemetry fetch missed the bound.
+    let mut fr = build_fill_record(
         &session_tag,
         outcome,
         now,
@@ -1635,7 +1694,7 @@ async fn place_live(
         fire.orderbook_entry,
         fire.p,
         shared.delta_from_open.unwrap_or(0.0),
-        exec_entry,
+        exec_entry.unwrap_or(entry),
         first_limit_price,
         requoted,
         requote_limit_price,
@@ -1645,7 +1704,9 @@ async fn place_live(
         fee,
         lat as i64,
         &resp.order_id,
-    ));
+    );
+    fr.exec_entry = exec_entry;
+    ledger.append(&fr);
     dash.lock().unwrap().triggers.push(TrigSummary {
         ts_iso: now_utc.to_rfc3339(),
         window_start: w_start,
@@ -2509,7 +2570,29 @@ mod tests {
         assert_eq!(filtered_ask(Some(0.10)), None);
         assert_eq!(filtered_ask(None), None);
     }
+    // ---- exec-signal-anchor slice 2: telemetry timeout seam + requote-never ----
+
+    // TC-8.x: the 500ms bound cuts a hung book fetch — exec_entry degrades to None
+    // instead of stalling place_live's return for the client's 8s timeout.
+    // (Real-time test: tokio test-util pause/advance is not an enabled feature.)
+    #[tokio::test]
+    async fn telemetry_timeout_bounds_hung_fetch() {
+        let t0 = std::time::Instant::now();
+        let hung = std::future::pending::<Result<(), ()>>();
+        let out = tokio::time::timeout(Duration::from_millis(TELEMETRY_TIMEOUT_MS), hung).await;
+        assert!(out.is_err(), "timeout must fire, not hang");
+        let waited = t0.elapsed().as_millis() as u64;
+        assert!(waited >= TELEMETRY_TIMEOUT_MS && waited < 3000, "bounded near 500ms, got {waited}ms");
+        // fast path passes through untouched
+        let quick = tokio::time::timeout(
+            Duration::from_millis(TELEMETRY_TIMEOUT_MS),
+            std::future::ready(Ok::<f64, ()>(0.85)),
+        )
+        .await;
+        assert_eq!(quick.unwrap().unwrap(), 0.85);
+    }
 }
+
 
 
 
