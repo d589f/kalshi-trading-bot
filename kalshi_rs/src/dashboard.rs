@@ -273,7 +273,17 @@ impl Dash {
             .map(|w| {
                 let s = self.triggers.iter().find(|t| wkey(&t.window_start) == *w);
                 let p = self.paper.iter().find(|t| wkey(&t.window_start) == *w);
-                let c = self.shadow_com.iter().find(|t| wkey(&t.window_start) == *w);
+                // shadow_com carries BOTH the strategy's shadow twin (live=false) and
+                // real live fills (live=true) — split them so the green line stays a
+                // strategy line and the LIVE line is real money.
+                let c = self
+                    .shadow_com
+                    .iter()
+                    .find(|t| !t.live && wkey(&t.window_start) == *w);
+                let lv = self
+                    .shadow_com
+                    .iter()
+                    .find(|t| t.live && wkey(&t.window_start) == *w);
                 let f1 = self.paper_f1.iter().find(|t| wkey(&t.window_start) == *w);
                 let match_us = match (s, p) {
                     (Some(s), Some(p)) => Some(s.side.eq_ignore_ascii_case(&p.side)),
@@ -281,6 +291,11 @@ impl Dash {
                 };
                 let match_com = match (c, p) {
                     (Some(c), Some(p)) => Some(c.side.eq_ignore_ascii_case(&p.side)),
+                    _ => None,
+                };
+                // LIVE ↔ paper-F1 side agreement: only windows where BOTH exist count
+                let match_lv = match (lv, f1) {
+                    (Some(l), Some(f)) => Some(l.side.eq_ignore_ascii_case(&f.side)),
                     _ => None,
                 };
                 json!({
@@ -316,6 +331,16 @@ impl Dash {
                     "f1_pnl": f1.and_then(|x| x.pnl),
                     "f1_p": f1.and_then(|x| x.p_model),
                     "f1_result": f1.and_then(|x| x.result.clone()),
+                    // --- real live fills (raw $5 money) ---
+                    "lv_side": lv.map(|x| x.side.to_uppercase()),
+                    "lv_entry": lv.map(|x| x.entry),
+                    "lv_delta": lv.map(|x| x.delta),
+                    "lv_pnl": lv.and_then(|x| x.pnl),
+                    "lv_result": lv.and_then(|x| x.result.clone()),
+                    "lv_won": lv.and_then(|x| x.won),
+                    "lv_count": lv.map(|x| x.count),
+                    "lv_p": lv.and_then(|x| x.p),
+                    "match_lv": match_lv,
                 })
             })
             .collect();
@@ -326,7 +351,8 @@ impl Dash {
     fn body_json(&self) -> String {
         let cmp = self.compare();
         // side-agreement summary among windows where BOTH paper and that shadow fired
-        let (mut us_n, mut us_ok, mut com_n, mut com_ok) = (0i64, 0i64, 0i64, 0i64);
+        let (mut us_n, mut us_ok, mut com_n, mut com_ok, mut lv_n, mut lv_ok) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
         for c in &cmp {
             if let Some(b) = c.get("match_us").and_then(|v| v.as_bool()) {
                 us_n += 1;
@@ -340,8 +366,24 @@ impl Dash {
                     com_ok += 1;
                 }
             }
+            if let Some(b) = c.get("match_lv").and_then(|v| v.as_bool()) {
+                lv_n += 1;
+                if b {
+                    lv_ok += 1;
+                }
+            }
         }
         let pct = |ok: i64, n: i64| if n > 0 { (1000.0 * ok as f64 / n as f64).round() / 10.0 } else { 0.0 };
+        let cut = self.started_iso.as_str();
+        // real live fills in-period: positions = fills pushed (resolved or not);
+        // pnl = raw $5 sum over the resolved ones (authoritative absolute figure)
+        let lv_rows: Vec<&TrigSummary> = self
+            .shadow_com
+            .iter()
+            .filter(|t| t.live && t.window_start.as_str() >= cut)
+            .collect();
+        let lv_positions = lv_rows.len();
+        let lv_pnl: f64 = lv_rows.iter().filter_map(|t| t.pnl).sum();
         json!({
             "live": self.live,
             "live_com": self.live_com,
@@ -353,8 +395,11 @@ impl Dash {
             "summary": {
                 "us_match": us_ok, "us_total": us_n, "us_pct": pct(us_ok, us_n),
                 "com_match": com_ok, "com_total": com_n, "com_pct": pct(com_ok, com_n),
-                "com_positions": self.shadow_com.iter().filter(|t| t.window_start.as_str() >= self.started_iso.as_str()).count(),
+                "com_positions": self.shadow_com.iter().filter(|t| !t.live && t.window_start.as_str() >= cut).count(),
                 "com_updated": self.shadow_com_updated,
+                "lv_match": lv_ok, "lv_total": lv_n, "lv_pct": pct(lv_ok, lv_n),
+                "lv_positions": lv_positions,
+                "lv_pnl": r2(lv_pnl),
             },
             "started": self.started_iso,
         })
@@ -798,4 +843,87 @@ mod tests {
         assert_eq!(d.triggers[0].pnl, Some(13.0));
         assert_eq!(d.triggers[1].pnl, None);
     }
+    // ---- slice 2: compare() split + body_json lv aggregates ----
+
+    fn trig(w: &str, side: &str, entry: f64, pnl: Option<f64>, live: bool) -> TrigSummary {
+        TrigSummary {
+            window_start: format!("{w}:00+00:00"),
+            ticker: "T".into(),
+            side: side.into(),
+            entry,
+            pnl,
+            result: pnl.map(|_| "yes".to_string()),
+            live,
+            ..Default::default()
+        }
+    }
+    fn pf1(w: &str, side: &str, pnl: Option<f64>) -> PaperTrade {
+        PaperTrade {
+            window_start: format!("{w}:00+00:00"),
+            side: side.into(),
+            entry_price: 0.8,
+            pnl,
+            result: pnl.map(|_| "WIN".to_string()),
+            ..Default::default()
+        }
+    }
+
+    // AC-3/AC-4: com_* exclusively from live=false, lv_* exclusively from live=true;
+    // one-sided windows leave the other side null.
+    #[test]
+    fn compare_splits_shadow_and_live() {
+        let mut d = Dash {
+            started_iso: "2026-07-05T00:00".into(),
+            ..Default::default()
+        };
+        // W1: both twin (signal 0.85) and live fill (eff 0.87)
+        d.shadow_com.push(trig("2026-07-05T12:00", "yes", 0.85, Some(13.0), false));
+        d.shadow_com.push(trig("2026-07-05T12:00", "yes", 0.87, Some(0.55), true));
+        // W2: twin only (live no-fill — the flat-gap window)
+        d.shadow_com.push(trig("2026-07-05T12:15", "no", 0.70, Some(-70.0), false));
+        // W3: live only (degenerate)
+        d.shadow_com.push(trig("2026-07-05T12:30", "no", 0.75, None, true));
+        d.paper_f1.push(pf1("2026-07-05T12:00", "YES", Some(24.0)));
+        d.paper_f1.push(pf1("2026-07-05T12:15", "NO", Some(-100.0)));
+        let cmp = d.compare();
+        let row = |w: &str| cmp.iter().find(|c| c["window"] == w).unwrap().clone();
+        let w1 = row("2026-07-05T12:00");
+        assert_eq!(w1["com_entry"], 0.85);
+        assert_eq!(w1["lv_entry"], 0.87);
+        assert_eq!(w1["com_pnl"], 13.0);
+        assert_eq!(w1["lv_pnl"], 0.55);
+        assert_eq!(w1["match_lv"], true);
+        let w2 = row("2026-07-05T12:15");
+        assert_eq!(w2["com_entry"], 0.70);
+        assert!(w2["lv_side"].is_null(), "no-fill window must have null lv_*");
+        assert!(w2["match_lv"].is_null(), "lv absent -> excluded from denominator");
+        let w3 = row("2026-07-05T12:30");
+        assert!(w3["com_side"].is_null());
+        assert_eq!(w3["lv_entry"], 0.75);
+        assert!(w3["lv_pnl"].is_null(), "unresolved live row keeps lv_pnl null");
+        assert!(w3["match_lv"].is_null(), "no paper-F1 -> match_lv excluded");
+    }
+
+    // Summary aggregates: lv_positions counts fills (resolved or not); lv_pnl sums
+    // only resolved raw pnl; all-shadow feed -> every lv aggregate zero.
+    #[test]
+    fn body_json_lv_aggregates() {
+        let mut d = Dash {
+            started_iso: "2026-07-05T00:00".into(),
+            ..Default::default()
+        };
+        d.shadow_com.push(trig("2026-07-05T12:00", "yes", 0.87, Some(0.55), true));
+        d.shadow_com.push(trig("2026-07-05T12:15", "no", 0.75, None, true));
+        d.shadow_com.push(trig("2026-07-05T12:00", "yes", 0.85, Some(13.0), false));
+        let v: serde_json::Value = serde_json::from_str(&d.body_json()).unwrap();
+        assert_eq!(v["summary"]["lv_positions"], 2);
+        assert_eq!(v["summary"]["lv_pnl"], 0.55);
+        assert_eq!(v["summary"]["com_positions"], 1); // shadow rows only now
+        let empty: serde_json::Value =
+            serde_json::from_str(&Dash { started_iso: "2026-07-05T00:00".into(), ..Default::default() }.body_json())
+                .unwrap();
+        assert_eq!(empty["summary"]["lv_positions"], 0);
+        assert_eq!(empty["summary"]["lv_pnl"], 0.0);
+    }
 }
+
