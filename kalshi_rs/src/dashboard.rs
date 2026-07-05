@@ -126,6 +126,7 @@ impl Dash {
     /// Update the matching trigger with its settlement. `live` is part of the match:
     /// a live fill and its shadow twin can share (ticker, side, entry) when
     /// eff == signal_entry — without the flag the wrong row could take the result.
+    /// Returns whether a row matched (replay uses it for the legacy-resolve fallback).
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         &mut self,
@@ -136,7 +137,7 @@ impl Dash {
         won: bool,
         pnl: f64,
         live: bool,
-    ) {
+    ) -> bool {
         for t in self.triggers.iter_mut() {
             if t.ticker == ticker
                 && t.side == side
@@ -147,9 +148,10 @@ impl Dash {
                 t.result = Some(result.to_string());
                 t.won = Some(won);
                 t.pnl = Some(pnl);
-                break;
+                return true;
             }
         }
+        false
     }
 
     fn agg(&self) -> serde_json::Value {

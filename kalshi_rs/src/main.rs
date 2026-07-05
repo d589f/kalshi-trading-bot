@@ -361,15 +361,32 @@ fn replay_line_into(d: &mut Dash, line: &str) {
                 });
             }
         }
-        Some("resolve") => d.resolve(
-            v["market_ticker"].as_str().unwrap_or(""),
-            v["side"].as_str().unwrap_or(""),
-            v["entry"].as_f64().unwrap_or(0.0),
-            v["result"].as_str().unwrap_or(""),
-            v["won"].as_bool().unwrap_or(false),
-            v["pnl_usd"].as_f64().unwrap_or(0.0),
-            v["live"].as_bool().unwrap_or(false),
-        ),
+        Some("resolve") => {
+            let (t, s, e) = (
+                v["market_ticker"].as_str().unwrap_or("").to_string(),
+                v["side"].as_str().unwrap_or("").to_string(),
+                v["entry"].as_f64().unwrap_or(0.0),
+            );
+            let (res, won, pnl) = (
+                v["result"].as_str().unwrap_or("").to_string(),
+                v["won"].as_bool().unwrap_or(false),
+                v["pnl_usd"].as_f64().unwrap_or(0.0),
+            );
+            match v.get("live").and_then(|x| x.as_bool()) {
+                Some(b) => {
+                    d.resolve(&t, &s, e, &res, won, pnl, b);
+                }
+                None => {
+                    // LEGACY resolve (pre-feature, no flag). Pre-feature history is NOT
+                    // all-shadow: live fills were LiveTriggerRecord{live:true} while
+                    // their resolves had no flag — try shadow first (majority), then
+                    // fall back to the live row so historical live fills stay resolved.
+                    if !d.resolve(&t, &s, e, &res, won, pnl, false) {
+                        d.resolve(&t, &s, e, &res, won, pnl, true);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2297,7 +2314,53 @@ mod tests {
         assert!(!twin_should_emit(None, None)); // no window key -> never
         assert!(!twin_should_emit(Some("W1"), None));
     }
+    // MAJOR-1 regression (code review): PRE-FEATURE live fills are LiveTriggerRecord
+    // rows with live:true, but their resolves were written WITHOUT the flag. The
+    // legacy-resolve fallback must attach them to the live row — otherwise every
+    // historical live fill (incl. today's F1 fills) renders unresolved and the LIVE
+    // chart line starts empty.
+    #[test]
+    fn replay_legacy_resolve_falls_back_to_live_row() {
+        let mut d = Dash::default();
+        // pre-feature live fill (LiveTriggerRecord always carried live:true)
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"trigger","outcome":"filled","live":true,"ts_iso":"t","window_start":"W1","market_ticker":"T","side":"yes","entry":0.87,"count":6,"delta_from_open":60.0}"#,
+        );
+        // its settlement, written by the OLD ResolveRecord (no live key)
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"resolve","market_ticker":"T","side":"yes","entry":0.87,"result":"yes","won":true,"pnl_usd":0.55}"#,
+        );
+        assert!(d.triggers[0].live);
+        assert_eq!(d.triggers[0].pnl, Some(0.55), "legacy resolve must reach the live row");
+        // and when BOTH a legacy shadow row and a legacy live row exist at the same
+        // entry, the legacy resolve prefers the shadow row (pre-feature majority) —
+        // the second legacy resolve then reaches the live row via the fallback.
+        let mut d = Dash::default();
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"trigger","ts_iso":"t","window_start":"W1","market_ticker":"T","side":"yes","entry":0.87,"count":112,"delta_from_open":60.0}"#,
+        );
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"trigger","outcome":"filled","live":true,"ts_iso":"t","window_start":"W1","market_ticker":"T","side":"yes","entry":0.87,"count":6,"delta_from_open":60.0}"#,
+        );
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"resolve","market_ticker":"T","side":"yes","entry":0.87,"result":"yes","won":true,"pnl_usd":13.0}"#,
+        );
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"resolve","market_ticker":"T","side":"yes","entry":0.87,"result":"yes","won":true,"pnl_usd":0.55}"#,
+        );
+        let tw = d.triggers.iter().find(|t| !t.live).unwrap();
+        let lv = d.triggers.iter().find(|t| t.live).unwrap();
+        assert_eq!(tw.pnl, Some(13.0));
+        assert_eq!(lv.pnl, Some(0.55));
+    }
 }
+
 
 
 
