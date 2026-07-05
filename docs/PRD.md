@@ -6,7 +6,7 @@ with a fixed structure: description, user story, functional requirements,
 non-functional requirements, acceptance criteria, affected endpoints, schema
 changes, and UI changes. Sections cross-reference each other by number.
 
-- **Version:** 0.3
+- **Version:** 0.4
 - **Last updated:** 2026-07-05
 - **Owner:** trading-bot maintainers
 
@@ -888,3 +888,342 @@ Yes — chart, table, and cards on the Buffalo dashboard (`dashboard.rs` HTML/JS
   live order no-filled (no `lv_*`) or paper-F1 did not trade are excluded from the
   denominator — the card copy MUST make the denominator explicit to avoid misreading
   the percentage as coverage.
+
+---
+
+## 4. Execution Signal-Anchor (Re-anchor Live IOC to the Signal Price)
+
+Internal id: `exec-signal-anchor`. A **real-money order-path change** on the EU live
+trader (`kalshi_rs`, strategy `f1_d50cap75`, `$5`, subaccount #1): re-anchor the live
+IOC limit price and sizing to the **signal entry** (`fire.entry`, the paper-1:1 gate
+price) instead of the **fresh order-time ask**, and remove the synchronous pre-order
+orderbook GET from the critical path. Gated behind a new `EXEC_ANCHOR` env whose
+default (`ask`) is **byte-identical** to today's behavior — the same
+regression-guarantee pattern as the `SESSION` env in Section 2 (`select_session`,
+`kalshi_rs/src/main.rs` ≈ lines 64-78). Cross-references Section 1
+(`live-exec-telemetry-latch-fix`) for the `exec_entry` field, the `drift`/`walk`
+decomposition, `build_fill_record`/`build_context_record`, and the P0b
+latch-on-fill + bounded-retry rails; Section 2 (`live-f1-strategy`) for `PRICE_BUF`
+(prod `0.06`), the F1 gate, and the EU rollout; Section 3
+(`dashboard-f1-live-line`) for the live/shadow `TrigSummary.live` split the dashboard
+consumes (unchanged here).
+
+### 4.1 Feature description
+
+Today `place_live` (`kalshi_rs/src/main.rs` ≈ lines 1364-1618) runs a **synchronous**
+`rest.get_orderbook(&book.ticker, 10).await` **before** building the order
+(≈ lines 1447-1457), derives `exec_entry` from the **current real ask** (filtered to
+`(0.50, 0.98]`, else falls back to the signal `entry`), then prices the IOC limit at
+`exec_entry ± PRICE_BUF` (≈ lines 1458-1461) and sizes `count = round(stake /
+exec_entry)` (≈ lines 1467-1473). On a no-fill it **re-quotes once deeper** at
+`exec_entry ± REQUOTE_BUF` (≈ lines 1491-1513). This chases the ask: the book runs
+away during the round-trip, the re-quote chases it further, and the `(0.50, 0.98]`
+filter lets the limit exceed the `0.92` signal cap.
+
+**Measured motivation** (prod EU box, 2026-07-05, 20 real F1 fills, Section 1 P0
+telemetry decomposition `gap = drift + walk`, `drift = exec_entry − signal_entry`,
+`walk = eff − exec_entry`):
+
+| metric | value | reading |
+|--------|-------|---------|
+| mirror gap (`signal_entry` − paper-F1 entry) | **+0.55c** | the Rust gate reproduces paper ≈ 1:1 (Section 2 fidelity holds) |
+| **drift** (`exec_entry − signal_entry`) mean | **+3.79c** | **the entire entry degradation** — the ask running away in the ~250-500ms between signal and order |
+| walk (`eff − exec_entry`) mean | **−0.14c** | execution vs the (already-drifted) exec anchor is essentially free |
+| fills above the `0.92` signal cap | **4 / 20** (0.927-0.983) | breakeven WR **93-98%** — `exec_entry ± PRICE_BUF` chased the fresh ask past the cap under the `0.98` filter |
+| day PnL / WR | **−$2.21 @ 85% WR** | winners priced out of edge by drift |
+
+The synchronous pre-order orderbook GET is responsible for **~100-250ms** of that
+~250-500ms signal→order gap; removing it makes the order arrive **150-250ms earlier**.
+
+**Counterfactual on the same 20 fills** (re-price the recorded fills at a fixed anchor):
+
+| anchor | day PnL | vs actual |
+|--------|---------|-----------|
+| actual (`exec_entry ± PRICE_BUF`, prod) | −$2.21 | — |
+| **`signal_entry` + 6c** | **−$0.59** | **+$1.62** |
+| tight caps (`signal_entry` + 0..2c) | −$5.92 | −$3.71 (**WORSE** — tight caps no-fill the winners) |
+
+The tight-cap result is why the buffer is **exactly `PRICE_BUF` (prod 6c)**, not
+tighter: cutting the buffer cuts winners, not just losers. Because the counterfactual
+holds the fill set fixed but the real change also removes the pre-order fetch
+(order arrives 150-250ms earlier, so some of today's near-misses fill), the
+**conservative** expectation is that real signal-anchor coverage **beats** the
+−$0.59 counterfactual. The structural claim — **drift is the whole gap** — is the
+binding justification (see 4.10 on why the day-level number alone is noisy).
+
+**This feature.** Add an `EXEC_ANCHOR` env (`ask` | `signal`, default `ask`). In
+`signal` mode: (a) price the IOC limit at `signal_entry ± PRICE_BUF` and size at
+`round(stake / signal_entry)` — **no** synchronous book GET in the order path, so the
+POST fires immediately after the safety gates; (b) run the orderbook GET
+**concurrently** with the order POST (`tokio::join!`) purely for telemetry, recording
+its ask into `LiveTriggerRecord.exec_entry` (Section 1) so `drift`/`walk` stay
+meaningful — and never blocking the order on the fetch; (c) **disable** the deeper
+re-quote (anti-chase). The P0b bounded retry (Section 1 FR-8) is unchanged but
+**re-anchors at the same fixed `signal_entry ± PRICE_BUF`** each attempt (a fixed
+anchor, never a chase). In `ask` mode every path is byte-identical to today.
+
+### 4.2 User story
+
+As the **operator of the live Kalshi F1 trader**, I want the live IOC to be priced
+and sized off the **signal entry** (the paper-1:1 gate price) with a fixed
+`PRICE_BUF`, and I want the order to fire without first waiting on a synchronous
+orderbook fetch, so that the **+3.79c drift** that is currently the entire live-vs-paper
+entry loss is removed and no fill lands above the `0.92` signal cap — while a single
+`EXEC_ANCHOR` env keeps the default behavior byte-identical to today and preserves the
+`drift`/`walk` telemetry that proved the problem.
+
+### 4.3 Functional requirements
+
+**A. `EXEC_ANCHOR` selection (env-driven, fail-safe, byte-identical default)**
+
+1. Execution anchoring MUST be driven by an `EXEC_ANCHOR` environment variable
+   accepting exactly the values `ask` and `signal` (case/whitespace-trimmed,
+   consistent with `select_session` at `kalshi_rs/src/main.rs` ≈ lines 64-78). Unset
+   or empty MUST resolve to `ask`. A non-empty **unrecognized** value MUST **fail
+   loud** — log an error (via `error!`, mirroring the `session_warn` log at
+   `main.rs` ≈ lines 513-515) and **fall back to `ask`**, logging which anchor was
+   selected — never silently pick an unintended anchor on real money.
+2. The selector MUST be a **pure function** (e.g. `select_exec_anchor(env_val:
+   Option<&str>) -> (ExecAnchor, Option<String>)`, `ExecAnchor` = `Ask | Signal`)
+   returning `(Ask, None)` for unset/empty, `(Signal, None)` for `"signal"`,
+   `(Ask, None)` for `"ask"`, and `(Ask, Some(warning))` for any other non-empty
+   value — so the resolution is unit-testable without env or a live order, exactly as
+   `select_session` is (`main.rs` ≈ lines 2104-2115).
+3. With `EXEC_ANCHOR` unset or `ask`, `place_live` MUST be **byte-for-byte identical**
+   to the pre-feature code path: the synchronous `rest.get_orderbook(&book.ticker,
+   10).await` (`main.rs` ≈ lines 1447-1457), the `exec_entry ± PRICE_BUF` limit
+   (≈ lines 1458-1461), `count = round(stake / exec_entry)` (≈ lines 1467-1473), and
+   the deeper re-quote (≈ lines 1491-1513) all run as today. `EXEC_ANCHOR` is the only
+   behavior lever (same guarantee pattern as Section 2 NFR-1).
+
+**B. Signal-mode order construction (`place_live`, `main.rs`)**
+
+4. In `signal` mode the IOC limit price MUST be anchored to the **signal entry**
+   (`fire.entry`), NOT the fresh ask: for `Side::Yes`, `price = (signal_entry +
+   PRICE_BUF).min(0.99)`; for `Side::No`, `price = ((1.0 - signal_entry) -
+   PRICE_BUF).max(0.01)` — i.e. the existing formulas (`main.rs` ≈ lines 1458-1461)
+   with `exec_entry` replaced by `signal_entry` (`fire.entry`). `PRICE_BUF` remains
+   the existing env (`lcfg.price_buf`, `main.rs` ≈ line 541; prod `0.06`); it is NOT
+   changed by this feature. The final `.min(0.99)` / `.max(0.01)` safety clamp is
+   retained (it does not bind because `signal_entry ≤ max_entry = 0.92`, so the Yes
+   limit ≤ `0.92 + 0.06 = 0.98`; see FR-9).
+5. In `signal` mode sizing MUST use the **signal entry** as the denominator:
+   `count = round(stake / signal_entry)`, replacing `round(stake / exec_entry)`
+   (`main.rs` ≈ line 1467). The `[1, max_count]` clamp (≈ lines 1468-1473; `max_count`
+   = `MAX_COUNT` env, default 15) is **unchanged**. `first_limit_price` records this
+   signal-anchored limit (Section 1 FR-2).
+6. In `signal` mode there MUST be **no synchronous orderbook GET in the critical path
+   before `create_ioc`**. The limit and count depend only on `signal_entry` (no book
+   needed), so the order POST (`oc.create_ioc(...)`, `main.rs` ≈ lines 1476-1487)
+   MUST fire **immediately after** the daily-cap / loss-stop / band gates
+   (≈ lines 1428-1442). The `create_ioc` contract (`kalshi_rs/src/kalshi/orders.rs`
+   ≈ lines 103-133) is unchanged; the limit is still passed as a float and rounded to
+   cents by the existing `format!("{:.2}", price)` (orders.rs ≈ line 115).
+
+**C. Telemetry preservation (concurrent fetch, `exec_entry` stays meaningful)**
+
+7. In `signal` mode the orderbook GET MUST still run — but **concurrently** with the
+   order POST via `tokio::join!` (already available; no new dependency, NFR-3) — so
+   its latency is off the order's critical path. Its derived ask (the same
+   `KalshiBook::derive(...)` + `yes_ask`/`no_ask` selection as `main.rs` ≈ lines
+   1448-1454) MUST be recorded as `LiveTriggerRecord.exec_entry` (Section 1 FR-2;
+   field is already `Option<f64>`, `kalshi_rs/src/ledger.rs` ≈ line 167) with the
+   meaning **"ask at order time"**.
+8. The concurrent fetch MUST be **fail-open**: on GET error (or a filtered-out ask)
+   the order is **NOT** blocked or delayed, and `exec_entry` is recorded as `None`.
+   The order outcome depends **only** on the POST result, never on the fetch. This
+   keeps the `drift = exec_entry − signal_entry` / `walk = eff − exec_entry`
+   decomposition (Section 1 AC-2) computable whenever the fetch succeeds, and simply
+   absent (not wrong) when it fails.
+
+**D. Anti-chase (re-quote disabled; retry re-anchors at a fixed price)**
+
+9. In `signal` mode the deeper single re-quote (`main.rs` ≈ lines 1491-1513) MUST be
+   **disabled**: on a no-fill no second, deeper IOC is sent, and the recorded
+   `requote` flag MUST be `false` with `requote_limit_price` absent (`None`). (In
+   `ask` mode the re-quote is unchanged, still gated by `REQUOTE_BUF > PRICE_BUF`.)
+10. The Section 1 P0b bounded retry (`retry_max_attempts` = `RETRY_MAX_ATTEMPTS`,
+    default 2; `retry_cooldown_secs` = `RETRY_COOLDOWN_SECS`, default 3s; orchestrated
+    in `signal_loop` at `main.rs` ≈ lines 1206-1257 via `retry_gate` /
+    `counts_as_attempt` / `latch_decision`) is **unchanged**. A retried attempt in
+    `signal` mode MUST re-anchor at the **same** `signal_entry ± PRICE_BUF` (a fixed
+    anchor across attempts, NOT a progressively deeper chase). Latch-on-confirmed-fill,
+    the per-window attempt budget, and the cooldown are unchanged.
+
+**E. Safety band + API range (unchanged)**
+
+11. The pre-order signal-price band gate `0.50 < signal_entry ≤ cfg.max_entry_price`
+    (`main.rs` ≈ lines 1438-1442) is **unchanged** and still runs before any order in
+    both modes. With `max_entry = 0.92` and prod `PRICE_BUF = 0.06`, the resulting
+    `signal` Yes limit is ≤ `0.98`, within the Kalshi price range and the existing
+    `.min(0.99)` clamp; cents rounding is unchanged (FR-6).
+
+**F. Untouched paths**
+
+12. The following MUST be unchanged by this feature: the f6 default execution
+    (`EXEC_ANCHOR` unset → `ask`, byte-identical, FR-3); the honest shadow-twin
+    emission (`emit_trigger`, `main.rs` ≈ lines 1192-1201, 1261-1341; twin sizing
+    `round(cfg.stake / fire.entry)` at ≈ line 1279); the ledger record shapes
+    (`LiveTriggerRecord`, `TriggerRecord`, `ResolveRecord` in
+    `kalshi_rs/src/ledger.rs`) — `first_limit_price` / `requote` /
+    `requote_limit_price` fields are **reused**, not added; the Buffalo dashboard
+    (`kalshi_rs/src/dashboard.rs`, the live/shadow split of Section 3); and the MIRROR
+    1:1-with-paper signal path (`main.rs` ≈ lines 1008-1104). The existing **75**
+    tests (across `main.rs`, `ledger.rs`, `config.rs`, `mirror.rs`, `dashboard.rs`,
+    `signal.rs`, `f1_regression.rs`) MUST stay green; new tests are additive.
+
+**G. Rollout (EU box)**
+
+13. Rollout MUST be a **drop-in env change** on the EU box (`34.32.177.126`, systemd
+    `kalshi-shadow-com`): append `EXEC_ANCHOR=signal` to the existing `mirror.conf`
+    drop-in (alongside `SESSION=f1_d50cap75`, `STAKE=5`, `SUBACCOUNT=1`,
+    `MAX_ENTRY=0.92`, `PRICE_BUF=0.06` from Section 2 FR-9) and restart. The restart
+    MUST land in the **first ~60s of a 15-min window** so no open window is
+    mid-order. **Rollback** = remove the `EXEC_ANCHOR` line (or set `=ask`) and
+    restart — reverting to byte-identical legacy behavior with no data migration
+    (consistent with Section 2 NFR-4). **Acceptance observation**: subsequent live
+    fills show `eff ≤ signal_entry + 0.06` and the `drift` right-tail (`> 6c`)
+    disappears (see 4.5 AC-7).
+
+### 4.4 Non-functional requirements
+
+1. **Lower order-POST latency in signal mode.** With `EXEC_ANCHOR=signal` the order
+   POST MUST NOT be preceded by any orderbook round-trip: the critical-path latency
+   from gate-pass to `create_ioc` MUST be strictly lower than legacy (`ask`) mode,
+   which pays the synchronous book GET (~100-250ms measured). The telemetry fetch runs
+   concurrently (FR-7) and adds no order-path latency.
+2. **Fail-safe env parsing.** `EXEC_ANCHOR` parsing MUST never panic and MUST never
+   place an order on an unintended anchor: unknown values fail loud and fall back to
+   `ask` (FR-1), and the selector is pure/total (FR-2). This matches the
+   fail-closed-on-ambiguity stance of Section 2 NFR-5.
+3. **No new dependencies.** The concurrent fetch MUST use the already-available
+   `tokio::join!` (the crate is already a dependency). No new crate, feature flag, or
+   binary is introduced.
+4. **No hot-path regression in `ask` mode.** The `EXEC_ANCHOR` branch adds at most a
+   single enum comparison to the `ask` path; the 0.3s decision loop and legacy order
+   flow are otherwise untouched (FR-3).
+5. **Telemetry integrity.** The `drift`/`walk` decomposition (Section 1 AC-2) MUST
+   remain computable in `signal` mode whenever the concurrent fetch succeeds
+   (`exec_entry = Some(ask-at-order-time)`), and MUST degrade to `exec_entry = None`
+   (decomposition simply unavailable for that fill) on fetch failure — never to a
+   fabricated or order-blocking value (FR-8).
+
+### 4.5 Acceptance criteria
+
+1. **Default is byte-identical (unit-tested).** With `EXEC_ANCHOR` unset or `ask`, the
+   computed IOC limit and `count` equal the legacy values for a representative
+   `(signal_entry, exec_entry, PRICE_BUF, stake, side)` set — i.e. `limit =
+   exec_entry ± PRICE_BUF` and `count = round(stake / exec_entry)` — proven by a unit
+   test over both `Side::Yes` and `Side::No`.
+2. **Selector resolution (unit-tested).** `select_exec_anchor(None) == (Ask, None)`,
+   `("")/("  ") == (Ask, None)`, `("ask") == (Ask, None)`, `("signal") == (Signal,
+   None)`, `(" signal ") == (Signal, None)`, and any other non-empty value == `(Ask,
+   Some(_))` (a fail-loud warning) — mirroring `select_session`'s test
+   (`main.rs` ≈ lines 2104-2115).
+3. **Signal-mode limit and sizing (unit-tested).** With `EXEC_ANCHOR=signal`, the IOC
+   limit equals `signal_entry + PRICE_BUF` (Yes) / `(1 - signal_entry) - PRICE_BUF`
+   (No) rounded to cents by `format!("{:.2}", .)`, and `count == round(stake /
+   signal_entry)` clamped to `[1, max_count]` — independent of `exec_entry` — proven
+   by a unit test.
+4. **No pre-order book GET in signal mode (code-verified).** In `signal` mode there is
+   **no** `.await` on `rest.get_orderbook(...)` on the path from the band gate to
+   `create_ioc`; the book GET, if run, is inside the `tokio::join!` alongside the
+   order POST (FR-6/FR-7). Verified by code inspection plus a test/inspection showing
+   the order POST does not depend on the fetch result.
+5. **`exec_entry` still populated on concurrent success.** In `signal` mode, when the
+   concurrent orderbook fetch succeeds, the fill's `LiveTriggerRecord.exec_entry` is
+   `Some(ask-at-order-time)` (so `drift`/`walk` compute); when the fetch fails, the
+   order still completes and `exec_entry` is `None` (FR-8).
+6. **Re-quote never fires in signal mode.** For any `signal`-mode outcome (fill,
+   partial, no-fill, rejected), the recorded `requote == false` and
+   `requote_limit_price` is absent; no second `create_ioc` with a `-rq` client-order-id
+   is issued (FR-9). A retry (P0b) re-anchors at the same `signal_entry ± PRICE_BUF`
+   (FR-10).
+7. **Deployed fills confirm the fix.** After the EU rollout (`EXEC_ANCHOR=signal`),
+   live `LiveTriggerRecord` fills show `eff ≤ signal_entry + 0.06` and the `drift`
+   right-tail (`exec_entry − signal_entry > 6c`) disappears; no fill lands above the
+   `0.92` signal cap (compare against the 4/20 pre-feature cap breaches). Orders route
+   to subaccount #1 (Section 2).
+8. **Legacy tests green.** All 75 pre-existing tests still pass; the new
+   selector/limit/sizing tests are additive (FR-12).
+
+### 4.6 Affected endpoints
+
+Internal Rust binary — **no** HTTP routes are created or modified. Relevant
+**outbound** calls (contracts unchanged; only invocation ordering/anchor changes):
+
+- `OrderClient::create_ioc(...)` — `kalshi_rs/src/kalshi/orders.rs` ≈ lines 103-133;
+  called from `place_live` (`main.rs` ≈ lines 1476-1487). In `signal` mode it fires
+  immediately after the gates with a signal-anchored limit; its request schema,
+  cents formatting (`{:.2}`), and subaccount routing are unchanged. The `-rq` re-quote
+  invocation (≈ lines 1505-1512) does not occur in `signal` mode.
+- `KalshiRest::get_orderbook(ticker, depth)` — `kalshi_rs/src/kalshi/rest.rs` ≈ line
+  151; unchanged in contract. In `ask` mode it is awaited before the order (as today);
+  in `signal` mode it is awaited **concurrently** with the order POST
+  (`tokio::join!`), for telemetry only.
+
+### 4.7 Schema changes
+
+**No schema changes.** No SQL database. The append-only JSONL ledger record shapes are
+**unchanged** — this feature only changes the **values/semantics** written into
+existing `LiveTriggerRecord` fields (Section 1):
+
+- `exec_entry` (`Option<f64>`, `ledger.rs` ≈ line 167) now carries **"ask at order
+  time"** from the concurrent fetch in `signal` mode, and is `None` on fetch failure
+  (the `Option` already permits this; no shape change).
+- `first_limit_price` = the signal-anchored limit; `requote` = `false` and
+  `requote_limit_price` = `None` in `signal` mode. All three fields already exist
+  (`ledger.rs` ≈ lines 171-175) and are **reused**, not added.
+- **No new field** is added to `LiveTriggerRecord`, `TriggerRecord`, or
+  `ResolveRecord`. **New env input** `EXEC_ANCHOR` (optional; default `ask`) is the
+  only config-surface addition; no change to `STAKE`, `SUBACCOUNT`, `MAX_ENTRY`,
+  `PRICE_BUF`, `REQUOTE_BUF`, `RETRY_*`, `SESSION`, `MIRROR_SESSION`.
+
+### 4.8 UI changes
+
+**None.** The Buffalo dashboard (`kalshi_rs/src/dashboard.rs`) is unchanged. The
+live/shadow split and the LIVE line from Section 3 continue to consume
+`TrigSummary.live` and the resolver PnL as-is; a signal-anchored fill simply has an
+`eff` closer to `signal_entry`, which the existing LIVE line and drift/walk telemetry
+already render. No page, component, column, or card is added or modified.
+
+### 4.9 Out of scope
+
+- Changing `PRICE_BUF` or `REQUOTE_BUF` values (a separate prod-config change,
+  consistent with Sections 1.9 / 2.9). This feature keeps prod `PRICE_BUF = 0.06`; the
+  counterfactual (4.1) is precisely why the buffer stays at 6c and is not tightened.
+- Changing the strategy, the F1 gate, the MIRROR 1:1 path, the signal-price band, the
+  P0b latch/retry policy, the subaccount isolation, or the shadow-twin emission.
+- Any dashboard-UI, HTTP-endpoint, or ledger record-**shape** change (Section 4.7/4.8).
+- A Kalshi WebSocket orderbook feed, us-east co-location, or a modeled paper twin
+  (out of scope per Sections 1.9 / 2.9). These would attack the residual
+  signal→order latency further; `signal`-anchor is the software-only first step.
+- Applying `EXEC_ANCHOR=signal` to the f6 default or to shadow-only boxes as a default
+  (the env stays opt-in; default `ask` preserves legacy behavior everywhere).
+
+### 4.10 Risks and open questions
+
+- **More no-fills on fast runs.** Anchoring the limit at `signal_entry + 6c` (vs
+  chasing the fresh ask) means a fast-moving book can outrun the fixed buffer:
+  **5-7 of the 20** fills sampled 2026-07-05 would **not** have fit the 6c buffer at
+  their signal instant. This is **partially** recovered by (a) the order arriving
+  150-250ms earlier (no pre-order fetch, FR-6), so some near-misses fill, and (b) the
+  P0b bounded retry (up to 2 attempts / window, FR-10). The residual is an accepted
+  trade-off: the counterfactual shows tighter caps are strictly worse (they cut
+  winners), and the 6c buffer is the measured sweet spot.
+- **Sizing shift from exec to signal price.** `count = round(stake / signal_entry)`
+  (FR-5) uses a denominator ≤ the drifted `exec_entry`, so `signal` mode buys
+  **slightly more** contracts per `$5` than legacy. The `MAX_COUNT = 15` clamp (FR-5)
+  is unchanged and bounds the exposure; at F1 entries (`0.5-0.92`) the count delta is
+  small and stays under the cap.
+- **Noisy day-level counterfactual.** The −$2.21 day (4.1) is dominated by **one**
+  trade (17:15, **−$4.86**), so the day-level +$1.62 counterfactual improvement is
+  statistically noisy on a 20-fill sample. The **binding justification is
+  structural** — `drift` (+3.79c) is essentially the entire live-vs-paper entry gap
+  while `walk` (−0.14c) is ~0 — not the single-day PnL delta. This mirrors the
+  honest-risk framing of Section 2.10.
+- **Open question — buffer under F1's 180s momentum.** F1 enters at 180s (higher
+  momentum than f6's 270s; Section 2.10). Whether `PRICE_BUF = 6c` remains the right
+  fixed anchor as more `signal`-mode fills accrue is an **observation item** for the
+  Section 1 telemetry (the `drift`/`walk`/no-fill mix), not a blocker — the buffer is
+  an env and can be re-tuned without a rebuild (a separate config change, 4.9).
