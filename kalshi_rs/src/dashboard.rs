@@ -618,7 +618,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  <div class=pane><div class=ptitle>┌─[ signal ]──────────</div><div id=live></div></div>
 </div>
 <div class=pane style="margin-bottom:9px">
-<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#f778ba">paper F1</span> · <span class=green>SHADOW twin</span> · <span style="color:#ff7b72">LIVE real (старт от точки F1)</span> ]───</div>
+<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#f778ba">paper F1</span> · <span class=green>shadow f6</span> · <span style="color:#ff7b72">LIVE F1 real (старт от точки F1)</span> ]───</div>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px"></div>
 <div id=tip class=tip></div>
@@ -627,7 +627,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=hint>hover ~1s → детали окна · <button onclick=load()>refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
 </div>
 <div class=pane>
-<div class=ptitle>┌─[ windows: <span class=yellow>paper f6</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow</span> ]───</div>
+<div class=ptitle>┌─[ windows: <span class=yellow>paper f6</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=f1</th>
@@ -659,7 +659,7 @@ function initChart(){
  });
  const mk=(c,t)=>_chart.addLineSeries({color:c,lineWidth:2,title:t,priceLineVisible:false,lastValueVisible:true,
    priceFormat:{type:'custom',formatter:v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(0)}});
- _S.paper=mk('#e3a008','paper'); _S.com=mk('#3fb950','SHADOW'); _S.f1=mk('#f778ba','F1'); _S.lv=mk('#ff7b72','LIVE');
+ _S.paper=mk('#e3a008','paper'); _S.com=mk('#3fb950','SHADOW f6'); _S.f1=mk('#f778ba','F1'); _S.lv=mk('#ff7b72','LIVE');
  // zero baseline
  _S.paper.createPriceLine({price:0,color:'#555',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
@@ -719,7 +719,7 @@ function renderTip(r){
  // show the $5-normalized pnl (twin5 on the fill entry), not raw com_pnl which is a $100 shadow row
  const ltw=(r.com_pnl!=null&&r.com_entry)?twin5(r.com_entry,(r.com_won!=null?r.com_won:r.com_pnl>0)):r.com_pnl;
  const lnote=(r.com_pnl!=null&&Math.abs(r.com_pnl-ltw)>0.5)?` <span class=lbl>(raw $100-shadow ${r.com_pnl>=0?'+':''}${f(r.com_pnl,0)})</span>`:'';
- h+=tseg('🟢 SHADOW twin $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,ltw,lres,lnote);
+ h+=tseg('🟢 SHADOW f6 $5'+cnt,r.com_side,r.com_entry,r.com_delta,r.com_p,ltw,lres,lnote);
  const ptw=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
  const pnote=ptw!=null?` <span class=lbl>(orig $100-model ${r.pa_pnl>=0?'+':''}${f(r.pa_pnl,0)})</span>`:'';
  h+=tseg('📄 PAPER f6 $5-twin',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,ptw,r.pa_result,pnote);
@@ -776,7 +776,7 @@ function updateChart(cmp){
  _S.lv.setData(lvSeries);
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length, lvw=rows.filter(r=>r.lv_pnl!=null).length;
  const lvSum=rows.reduce((a,r)=>a+(r.lv_pnl||0),0);
- document.getElementById('chartlbl').textContent=`(paper/F1/SHADOW = uniform $5 twin · paper ${money(tot('pa_twin'))}/${paw}w · SHADOW ${money(tot('com_twin'))}/${cow}w · F1 ${money(tot('f1_twin'))} · LIVE real ${money(lvSum)}/${lvw}w, линия стартует от точки F1 · SHADOW-vs-LIVE gap = no-fills + slippage)`;
+ document.getElementById('chartlbl').textContent=`(paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
@@ -801,15 +801,15 @@ async function load(){
   +card('LIVE real · today',money(lc.day_pnl),rc(lc.day_pnl),true)
   +card('🔴 LIVE F1 (period, real $)',`${money(lvP)} · ${nLv}w · WR ${nLv?Math.round(100*wLv/nLv):0}%`,rc(lvP))
   +card('F1 $5-twin (period)',money(f1T),rc(f1T))
-  +card('SHADOW twin (period)',`${money(shT)} · ${nSh}w`,rc(shT))
+  +card('shadow f6 twin (period)',`${money(shT)} · ${nSh}w`,rc(shT))
   +card('paper f6 $5-twin (period)',money(pT),rc(pT))
   +card('live = % of F1-twin (те же окна)',edge!=null?`${edge}%`:'—',edge==null?'dim':edge>=90?'green':edge>=70?'yellow':'red');
  document.getElementById('match').innerHTML=
    card('LIVE ↔ paper-F1 side-match',`${f(S.lv_pct,1)}%`,S.lv_pct>=90?'green':S.lv_pct>=70?'yellow':'red',true)
   +card('LIVE: matched / оба торговали',`${S.lv_match||0} / ${S.lv_total||0}`,'')
   +card('LIVE fills (period)',`${S.lv_positions||0} · ${money(S.lv_pnl||0)}`,rc(S.lv_pnl))
-  +card('SHADOW ↔ paper side-match',`${f(S.com_pct,1)}%`,S.com_pct>=90?'green':S.com_pct>=70?'yellow':'red',true)
-  +card('SHADOW: matched / windows',`${S.com_match} / ${S.com_total}`,'green')
+  +card('shadow f6 ↔ paper f6 side-match',`${f(S.com_pct,1)}%`,S.com_pct>=90?'green':S.com_pct>=70?'yellow':'red',true)
+  +card('shadow f6: matched / windows',`${S.com_match} / ${S.com_total}`,'green')
   +card('positions P/F1/SH',`${d.paper_agg.positions}/${d.paper_f1_agg.positions}/${S.com_positions}`);
  document.getElementById('live').innerHTML=
   card('reason',`<span class="reason ${L.reason&&L.reason.startsWith('BUY')?'green':'yellow'}">${L.reason||'—'}</span>`)

@@ -395,6 +395,9 @@ fn replay_line_into(d: &mut Dash, line: &str) {
 #[derive(Clone)]
 struct Pending {
     ticker: String,
+    /// ledger session tag for the ResolveRecord (f6 shadow and the live strategy
+    /// resolve under their OWN tags)
+    session: String,
     side: &'static str, // "yes" | "no"
     entry: f64,
     count: f64,
@@ -736,7 +739,7 @@ async fn main() -> Result<()> {
         let led = ledger.clone();
         let dsh = dash.clone();
         let ls = live_state.clone();
-        tokio::spawn(async move { resolver(rc, pend, led, dsh, ls, session_sel).await });
+        tokio::spawn(async move { resolver(rc, pend, led, dsh, ls).await });
     }
 
     // 4) Signal loop @ 0.3s
@@ -854,9 +857,7 @@ async fn resolver(
     ledger: Arc<Ledger>,
     dash: Arc<Mutex<Dash>>,
     live_state: Arc<Mutex<LiveState>>,
-    sel: SessionSel,
 ) {
-    let session_tag = sel.session_tag();
     loop {
         tokio::time::sleep(Duration::from_secs(20)).await;
         let now = Utc::now();
@@ -880,7 +881,7 @@ async fn resolver(
                             kind: "resolve",
                             ts: now_secs(),
                             ts_iso: now.to_rfc3339(),
-                            session: &session_tag,
+                            session: &pd.session,
                             market_ticker: &pd.ticker,
                             side: pd.side,
                             entry: pd.entry,
@@ -940,6 +941,11 @@ async fn signal_loop(
     sel: SessionSel,
 ) {
     let session_tag = sel.session_tag();
+    // The REFERENCE SHADOW: the f6 strategy is always evaluated alongside the selected
+    // live strategy and emitted as a live=false would-be — the dashboard's green line
+    // stays "shadow f6" regardless of which strategy trades live.
+    let shadow_cfg = SessionSel::F6.config();
+    let shadow_tag = SessionSel::F6.session_tag();
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     // Restart latch: seed from the persisted last CONFIRMED fill. If that window is
     // still the current one (redeploy mid-window), the per-tick `fired_window ==
@@ -950,10 +956,9 @@ async fn signal_loop(
     let mut attempt_window: Option<String> = None;
     let mut attempt_count: i64 = 0;
     let mut last_attempt_ts: f64 = f64::NEG_INFINITY;
-    // Shadow-twin latch: the would-be is emitted once per window (in-memory only —
-    // a mid-window restart of a NO-FILL window may re-emit one twin; accepted, the
-    // dashboard dedupes per window. Filled windows are covered by fired_window's
-    // persisted boot seed).
+    // f6-shadow latch: the would-be is emitted once per window (in-memory only —
+    // a mid-window restart may re-emit one shadow row; accepted, the dashboard
+    // dedupes per window).
     let mut twin_window: Option<String> = None;
 
     loop {
@@ -1003,7 +1008,15 @@ async fn signal_loop(
         if let Some(murl) = mcfg.url.as_deref() {
             // MIRROR: window_open / Δ / σ / book come straight from the paper engine,
             // so our (validated) f6 filter produces the SAME side + entry as the paper.
-            match mirror::fetch(&http, murl, now_utc, &mcfg.session_key).await {
+            match mirror::fetch(
+                &http,
+                murl,
+                now_utc,
+                &mcfg.session_key,
+                Some(SessionSel::F6.key()), // f6 = reference shadow for the green line
+            )
+            .await
+            {
                 Some(m) if m.age_secs <= mcfg.max_age_secs => {
                     win = window::WindowState {
                         window_start: Some(m.window_start),
@@ -1015,6 +1028,11 @@ async fn signal_loop(
                     // H2 fix: key by cfg.sigma_type (f6→max30, f1→max10) so the gate's
                     // lookup can never miss and silently fall back to the local sigma.
                     insert_mirror_sigma(&mut sigmas, &cfg, m.sigma_max30);
+                    // f6 reference-shadow σ — best-effort: absence only disables the
+                    // shadow evaluation this tick, never the live path.
+                    if let Some(ss) = m.sigma_shadow {
+                        insert_mirror_sigma(&mut sigmas, &shadow_cfg, ss);
+                    }
                     delta_open = Some(m.delta_from_open);
                     delta_prev = Some(m.delta_from_prev);
                     last_trade_exp = m.last_trade_expensive;
@@ -1156,6 +1174,32 @@ async fn signal_loop(
             l.updated_iso = now_utc.to_rfc3339();
         }
 
+        // ---- f6 REFERENCE SHADOW (the dashboard's green line): evaluate the f6 gate on
+        //      the SAME mirrored state, independent of the selected live strategy, and
+        //      emit its would-be (live=false, own Pending scored on real settlement)
+        //      once per window. Gated on f6's OWN mirrored sigma being present — the
+        //      engine's local-sigma fallback would draw a wrong-formula shadow. ----
+        if lcfg.enabled
+            && order_client.is_some()
+            && !book.ticker.is_empty()
+            && shared
+                .sigmas
+                .get(&shadow_cfg.sigma_type)
+                .copied()
+                .unwrap_or(0.0)
+                > 0.0
+        {
+            if let Some(sfire) = evaluate(&shadow_cfg, &shared).fire {
+                if twin_should_emit(twin_window.as_deref(), win_key.as_deref()) {
+                    twin_window = win_key.clone();
+                    emit_trigger(
+                        &ledger, &pending, &shadow_cfg, &shared, &book, &win, &sfire, now,
+                        now_utc, &dash, &shadow_tag,
+                    );
+                }
+            }
+        }
+
         // ---- trigger → place a live order. P0b: latch the window only on a non-retryable
         //      outcome (a fill, or a deliberate skip); a no-fill/error re-attempts within the
         //      window (bounded by retry_max_attempts + cooldown) instead of burning it. ----
@@ -1165,24 +1209,10 @@ async fn signal_loop(
                 attempt_window = win_key.clone();
                 attempt_count = 0;
                 last_attempt_ts = f64::NEG_INFINITY;
-                twin_window = None;
             }
             let already = fired_window.as_deref() == win_key.as_deref();
             if !already && !book.ticker.is_empty() {
                 if lcfg.enabled && order_client.is_some() {
-                    // Honest shadow twin: record the strategy's would-be (live=false, its
-                    // own Pending scored on real settlement) ONCE per window, decoupled
-                    // from retry_gate and from place_live's fill/no-fill/skip outcome —
-                    // the green shadow line keeps moving even when the live order misses.
-                    // Inside `if !already`, so a boot-seeded filled-window restart skips
-                    // the twin along with the order (correct dedupe).
-                    if twin_should_emit(twin_window.as_deref(), win_key.as_deref()) {
-                        twin_window = win_key.clone();
-                        emit_trigger(
-                            &ledger, &pending, &cfg, &shared, &book, &win, &fire, now,
-                            now_utc, &dash, &session_tag,
-                        );
-                    }
                     if retry_gate(
                         attempt_count,
                         last_attempt_ts,
@@ -1301,6 +1331,7 @@ fn emit_trigger(
     if let Some(w_end_dt) = win.window_end {
         pending.lock().unwrap().push(Pending {
             ticker: book.ticker.clone(),
+            session: session_tag.to_string(),
             side: side_str,
             entry: fire.entry,
             count,
@@ -1570,6 +1601,7 @@ async fn place_live(
     if let Some(we) = win.window_end {
         pending.lock().unwrap().push(Pending {
             ticker: book.ticker.clone(),
+            session: session_tag.clone(),
             side: side_str,
             entry: eff,
             count: fill,
@@ -2285,6 +2317,7 @@ mod tests {
     fn retain_after_resolve_is_flag_scoped() {
         let mk = |live: bool| Pending {
             ticker: "T".to_string(),
+            session: if live { "f1_d50cap75_shadow" } else { "f6_wait270_shadow" }.to_string(),
             side: "yes",
             entry: 0.85,
             count: if live { 6.0 } else { 112.0 },

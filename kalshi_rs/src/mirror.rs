@@ -25,6 +25,10 @@ pub struct MirrorSnap {
     /// The selected session's `live_sigma` (f6 → max30, f1 → max10). Field NAME is kept
     /// for wire/struct compatibility — it is NOT always a max30 value.
     pub sigma_max30: f64,
+    /// The reference-shadow session's `live_sigma` (f6's max30) when a shadow session
+    /// key was requested and the paper exposes a sane value. None never blocks the
+    /// tick — it only disables the f6 shadow evaluation for that tick.
+    pub sigma_shadow: Option<f64>,
     pub ticker: String,
     pub yes_bid: Option<f64>,
     pub yes_ask: Option<f64>,
@@ -65,12 +69,15 @@ pub fn extract_live_sigma(sessions_state: &Value, session_key: &str) -> Option<f
 
 /// Fetch the selected session's live signal from the paper engine.
 /// `base` e.g. "http://127.0.0.1:8893"; `session_key` e.g. "f6_wait270" / "f1_d50cap75".
+/// `shadow_session_key` optionally names the reference-shadow session (f6) whose sigma
+/// rides along for the dashboard's shadow line — its absence never fails the fetch.
 /// Returns None on any error — the caller then SKIPS the tick rather than trade blind.
 pub async fn fetch(
     client: &reqwest::Client,
     base: &str,
     now_utc: DateTime<Utc>,
     session_key: &str,
+    shadow_session_key: Option<&str>,
 ) -> Option<MirrorSnap> {
     let st: Value = client
         .get(format!("{base}/api/state"))
@@ -94,6 +101,9 @@ pub async fn fetch(
     // The σ is the SELECTED session's per-session value (top-level state['sigma'] is a
     // different type): f6 → max30, f1 → max10. Fail-closed on missing/non-positive.
     let sigma = extract_live_sigma(&ss, session_key)?;
+    // Reference-shadow σ (f6 max30) is best-effort — no `?`, absence just skips the
+    // shadow evaluation this tick.
+    let sigma_shadow = shadow_session_key.and_then(|k| extract_live_sigma(&ss, k));
     let num = |k: &str| st.get(k).and_then(Value::as_f64);
 
     let last_update = parse_ts(st.get("last_update"))?;
@@ -107,6 +117,7 @@ pub async fn fetch(
         delta_from_open: num("delta_from_open").unwrap_or(0.0),
         delta_from_prev: num("delta_from_prev").unwrap_or(0.0),
         sigma_max30: sigma,
+        sigma_shadow,
         ticker: st.get("market_slug")?.as_str()?.to_string(),
         yes_bid: num("poly_yes_bid"),
         yes_ask: num("poly_yes_ask"),
