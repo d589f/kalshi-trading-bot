@@ -24,10 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use config::{SessionConfig, STATE_TICK_SECS};
+use config::{resolve_mirror_session_key, SessionConfig, SessionSel, STATE_TICK_SECS};
 use dashboard::{Dash, TrigSummary};
 use engine::{evaluate, Shared, Side};
 use kalshi::auth::Signer;
@@ -52,6 +52,44 @@ fn resolve_max_entry(default: f64, env_val: Option<String>) -> f64 {
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.5 && *v <= 0.99)
         .unwrap_or(default)
+}
+
+/// Resolve the strategy from the SESSION env. Unset/empty → F6 (today's default).
+/// A non-empty UNKNOWN value also falls back to F6 but returns a warning for main()
+/// to log FAIL-LOUD — a silent typo running the wrong strategy on real money is the
+/// failure mode this guards against. Pure (no logging/exit) so it stays testable.
+fn select_session(env_val: Option<&str>) -> (SessionSel, Option<String>) {
+    let raw = env_val.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return (SessionSel::F6, None);
+    }
+    match config::resolve_session_sel(raw) {
+        Some(sel) => (sel, None),
+        None => (
+            SessionSel::F6,
+            Some(format!(
+                "SESSION='{raw}' is not a known strategy (accepted: f6_wait270, f1_d50cap75) — falling back to f6_wait270"
+            )),
+        ),
+    }
+}
+
+/// Insert the mirrored paper sigma under the key the gate actually reads
+/// (`cfg.sigma_type`). Hardcoding "max30" here was the H2 bug: under F1
+/// (sigma_type="max10") the gate's lookup would MISS and silently fall back to the
+/// LOCAL realized5 sigma — trading a formula that is not the selected strategy's.
+fn insert_mirror_sigma(
+    sigmas: &mut std::collections::HashMap<String, f64>,
+    cfg: &SessionConfig,
+    val: f64,
+) {
+    sigmas.insert(cfg.sigma_type.clone(), val);
+}
+
+/// σ for the operator displays (status log + dashboard card), keyed by the SELECTED
+/// session's sigma_type — a hardcoded "max30" lookup would show 0.0 under F1.
+fn display_sigma(sigmas: &std::collections::HashMap<String, f64>, cfg: &SessionConfig) -> f64 {
+    sigmas.get(&cfg.sigma_type).copied().unwrap_or(0.0)
 }
 
 const SESSION_NAME: &str = "f6_wait270_shadow";
@@ -355,6 +393,9 @@ struct LiveCfg {
 struct MirrorCfg {
     url: Option<String>,
     max_age_secs: f64,
+    /// paper-engine session whose live_sigma we mirror (f6_wait270 / f1_d50cap75) —
+    /// explicit MIRROR_SESSION env wins, else the selected strategy's own key.
+    session_key: String,
 }
 
 const LIVE_STATE_PATH: &str = "live_state.json";
@@ -414,7 +455,14 @@ async fn main() -> Result<()> {
     let base = std::env::var("KALSHI_BASE").unwrap_or_else(|_| PROD_BASE.to_string());
     info!("kalshi base = {base}");
 
-    let mut cfg = SessionConfig::f6_wait270();
+    // Strategy selection (SESSION env; default f6). Unknown value = fail-loud + f6
+    // fallback so a typo can never silently run the wrong formula on real money.
+    let session_env = std::env::var("SESSION").ok();
+    let (session_sel, session_warn) = select_session(session_env.as_deref());
+    if let Some(w) = &session_warn {
+        error!("{w}");
+    }
+    let mut cfg = session_sel.config();
     cfg.max_entry_price = resolve_max_entry(cfg.max_entry_price, std::env::var("MAX_ENTRY").ok());
     info!(
         "session '{}': entry_wait={}min delta>={} p>={} sigma={} max_entry={} stake=${}",
@@ -448,9 +496,16 @@ async fn main() -> Result<()> {
     let mcfg = MirrorCfg {
         url: std::env::var("MIRROR_STATE_URL").ok().filter(|s| !s.is_empty()),
         max_age_secs: env_f64("MIRROR_MAX_AGE_SECS", 5.0),
+        session_key: resolve_mirror_session_key(
+            &session_sel,
+            std::env::var("MIRROR_SESSION").ok().as_deref(),
+        ),
     };
     if let Some(u) = &mcfg.url {
-        info!("MIRROR mode ON — signal sourced from paper engine {u} (max_age={}s)", mcfg.max_age_secs);
+        info!(
+            "MIRROR mode ON — signal sourced from paper engine {u} (max_age={}s, session={})",
+            mcfg.max_age_secs, mcfg.session_key
+        );
     }
     let http = reqwest::Client::new();
     let live_state = Arc::new(Mutex::new(load_live_state()));
@@ -856,9 +911,7 @@ async fn signal_loop(
         if let Some(murl) = mcfg.url.as_deref() {
             // MIRROR: window_open / Δ / σ / book come straight from the paper engine,
             // so our (validated) f6 filter produces the SAME side + entry as the paper.
-            // Session key literal is TEMPORARY (slice 2 compile fix) — slice 4 threads
-            // the resolved mirror_key here.
-            match mirror::fetch(&http, murl, now_utc, "f6_wait270").await {
+            match mirror::fetch(&http, murl, now_utc, &mcfg.session_key).await {
                 Some(m) if m.age_secs <= mcfg.max_age_secs => {
                     win = window::WindowState {
                         window_start: Some(m.window_start),
@@ -867,7 +920,9 @@ async fn signal_loop(
                         prev_close_price: Some(m.binance_price - m.delta_from_prev),
                     };
                     price = m.binance_price;
-                    sigmas.insert("max30".to_string(), m.sigma_max30);
+                    // H2 fix: key by cfg.sigma_type (f6→max30, f1→max10) so the gate's
+                    // lookup can never miss and silently fall back to the local sigma.
+                    insert_mirror_sigma(&mut sigmas, &cfg, m.sigma_max30);
                     delta_open = Some(m.delta_from_open);
                     delta_prev = Some(m.delta_from_prev);
                     last_trade_exp = m.last_trade_expensive;
@@ -944,14 +999,15 @@ async fn signal_loop(
         if now - last_status_log > 10.0 {
             last_status_log = now;
             info!(
-                "[{}] {} | btc={:.0} Δopen={:?} τ={:.1} e={:.1} σmax30={:.6} mkt={} yes_ask={:?} no_ask={:?}",
+                "[{}] {} | btc={:.0} Δopen={:?} τ={:.1} e={:.1} σ({})={:.6} mkt={} yes_ask={:?} no_ask={:?}",
                 SESSION_NAME,
                 res.reason,
                 price,
                 shared.delta_from_open,
                 tau,
                 elapsed,
-                shared.sigmas.get("max30").copied().unwrap_or(0.0),
+                cfg.sigma_type,
+                display_sigma(&shared.sigmas, &cfg),
                 book.ticker,
                 book.yes_ask,
                 book.no_ask,
@@ -991,7 +1047,8 @@ async fn signal_loop(
             l.delta_prev = shared.delta_from_prev;
             l.tau = tau;
             l.elapsed = elapsed;
-            l.sigma_max30 = shared.sigmas.get("max30").copied().unwrap_or(0.0);
+            // field NAME kept for dashboard wire-compat; value = the SELECTED session's σ
+            l.sigma_max30 = display_sigma(&shared.sigmas, &cfg);
             l.p = disp_p;
             l.snr = disp_snr;
             l.reason = res.reason.clone();
@@ -1873,4 +1930,99 @@ mod tests {
         // even if place_live could be called again, a fill latches and stops further orders
         assert_eq!(sim_window(&[Outcome::Filled, Outcome::Filled], 5, 0.0), (1, true));
     }
+    // ---- slice 4: strategy selection + sigma-key wiring (live-f1-strategy) ----
+
+    // TC-10.2/10.3: select_session matrix — unset/empty -> silent f6; known -> exact;
+    // unknown -> f6 WITH a warning naming the bad value and the accepted set.
+    #[test]
+    fn select_session_matrix() {
+        assert_eq!(select_session(None), (SessionSel::F6, None));
+        assert_eq!(select_session(Some("")), (SessionSel::F6, None));
+        assert_eq!(select_session(Some("   ")), (SessionSel::F6, None));
+        assert_eq!(select_session(Some("f6_wait270")), (SessionSel::F6, None));
+        assert_eq!(select_session(Some("f1_d50cap75")), (SessionSel::F1, None));
+        assert_eq!(select_session(Some(" f1_d50cap75 ")), (SessionSel::F1, None));
+        let (sel, warn) = select_session(Some("f7_foo"));
+        assert_eq!(sel, SessionSel::F6);
+        let w = warn.expect("unknown SESSION must warn");
+        assert!(w.contains("f7_foo") && w.contains("f6_wait270") && w.contains("f1_d50cap75"));
+        let (sel, warn) = select_session(Some("F1_D50CAP75")); // case-sensitive
+        assert_eq!(sel, SessionSel::F6);
+        assert!(warn.is_some());
+    }
+
+    // TC-4.1/4.3: the mirrored sigma lands under the SELECTED session's sigma_type key.
+    #[test]
+    fn insert_mirror_sigma_keys_by_sigma_type() {
+        let mut m = std::collections::HashMap::new();
+        insert_mirror_sigma(&mut m, &SessionConfig::f1_d50cap75(), 0.0002);
+        assert_eq!(m.get("max10"), Some(&0.0002));
+        assert_eq!(m.get("max30"), None);
+        let mut m = std::collections::HashMap::new();
+        insert_mirror_sigma(&mut m, &SessionConfig::f6_wait270(), 0.0005);
+        assert_eq!(m.get("max30"), Some(&0.0005)); // legacy behavior identical
+    }
+
+    // Shared fixture: F1-passing signal (delta 60 >= 50, elapsed 3.5 >= 3.0, entry 0.85
+    // <= 0.92; with sigma 0.0002 @ price 100k tau 2.0 -> snr 1.5, p=phi(0.6)~0.726 >= 0.65).
+    fn f1_shared(local_sigma: Option<f64>) -> Shared {
+        Shared {
+            binance_price: Some(100_000.0),
+            delta_from_open: Some(60.0),
+            delta_from_prev: Some(30.0),
+            tau: 2.0,
+            elapsed_min: 3.5,
+            sigma: local_sigma,
+            yes_ask: Some(0.85),
+            no_ask: Some(0.10),
+            ..Default::default()
+        }
+    }
+
+    // TC-4.2 (CRITICAL, merge blocker): with the mirrored sigma under the CORRECT key
+    // ("max10"), the F1 gate decision is INVARIANT to the local fallback sigma — the
+    // engine's .or(s.sigma) path is provably never exercised.
+    #[test]
+    fn f1_gate_invariant_to_local_sigma_fallback() {
+        let cfg = SessionConfig::f1_d50cap75();
+        let mut results = vec![];
+        for local in [None, Some(1e-6), Some(0.005), Some(999.0)] {
+            let mut s = f1_shared(local);
+            insert_mirror_sigma(&mut s.sigmas, &cfg, 0.0002);
+            let r = evaluate(&cfg, &s);
+            results.push((r.reason.clone(), r.fire.map(|f| (f.side, f.entry))));
+        }
+        for w in results.windows(2) {
+            assert_eq!(w[0], w[1], "gate decision must not depend on local sigma");
+        }
+        // and it actually fires on the mirrored sigma
+        assert_eq!(results[0].0, "BUY YES");
+        assert_eq!(results[0].1, Some((Side::Yes, 0.85)));
+    }
+
+    // TC-4.5: pre-fix defect pin — sigma left under "max30" while F1 wants "max10"
+    // makes the decision DEPEND on the local sigma (fires on a tiny one, P-LOW on a
+    // big one). This is the silent-wrong-formula failure the fix eliminates.
+    #[test]
+    fn f1_gate_with_wrong_key_depends_on_local_sigma() {
+        let cfg = SessionConfig::f1_d50cap75();
+        let mut s = f1_shared(Some(0.0002)); // favorable local sigma
+        s.sigmas.insert("max30".to_string(), 0.0002); // OLD bug: wrong key
+        assert_eq!(evaluate(&cfg, &s).reason, "BUY YES");
+        let mut s = f1_shared(Some(0.005)); // unfavorable local sigma
+        s.sigmas.insert("max30".to_string(), 0.0002);
+        assert!(evaluate(&cfg, &s).reason.starts_with("P-LOW"));
+    }
+
+    // TC-4.6: operator displays keyed by the selected sigma_type — nonzero under F1.
+    #[test]
+    fn display_sigma_keyed_by_selected_type() {
+        let cfg1 = SessionConfig::f1_d50cap75();
+        let cfg6 = SessionConfig::f6_wait270();
+        let mut m = std::collections::HashMap::new();
+        m.insert("max10".to_string(), 0.0003);
+        assert_eq!(display_sigma(&m, &cfg1), 0.0003);
+        assert_eq!(display_sigma(&m, &cfg6), 0.0); // no max30 present
+    }
 }
+
