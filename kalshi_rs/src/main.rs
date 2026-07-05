@@ -80,7 +80,6 @@ fn select_session(env_val: Option<&str>) -> (SessionSel, Option<String>) {
 /// Resolve EXEC_ANCHOR (how the live IOC limit is priced). Unset/empty → Ask (today's
 /// default). Non-empty UNKNOWN → Ask + a warning for main() to log FAIL-LOUD — a typo
 /// must NEVER flip real-money execution to Signal. Pure, testable.
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 fn select_exec_anchor(env_val: Option<&str>) -> (ExecAnchor, Option<String>) {
     let raw = env_val.map(str::trim).unwrap_or("");
     if raw.is_empty() {
@@ -100,26 +99,24 @@ fn select_exec_anchor(env_val: Option<&str>) -> (ExecAnchor, Option<String>) {
 /// Telemetry-fetch bound in signal mode: the concurrent orderbook GET inside the order
 /// join! is cut off here so a slow book (client timeout 8s) can never stall place_live's
 /// return — the order is already gone; only exec_entry degrades to None.
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 const TELEMETRY_TIMEOUT_MS: u64 = 500;
 
 // ---- signal-anchor pricing/sizing (pure; wired into place_live's Signal arm) ----
 // The exec_* twins mirror the legacy ask-arm formulas so byte-identity is testable.
 
 /// Signal mode, YES side: limit = signal entry + crossing allowance, API-clamped.
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 fn signal_yes_limit(signal_entry: f64, price_buf: f64) -> f64 {
     (signal_entry + price_buf).min(0.99)
 }
 /// Signal mode, NO side (NO book prices = 1 - yes price).
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 fn signal_no_limit(signal_entry: f64, price_buf: f64) -> f64 {
     ((1.0 - signal_entry) - price_buf).max(0.01)
 }
 /// Sizing off the SIGNAL price (legacy sizes off the drifted exec price).
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 fn signal_count(stake: f64, signal_entry: f64, max_count: i64) -> f64 {
-    (stake / signal_entry).round().clamp(1.0, max_count as f64)
+    // max(1): f64::clamp panics when min > max — a misconfigured MAX_COUNT<1 must not
+    // crash the trading task at order time (review MINOR-1)
+    (stake / signal_entry).round().clamp(1.0, max_count.max(1) as f64)
 }
 /// Legacy formulas keyed on the exec (fresh-ask) price — for byte-identity assertions.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -132,10 +129,9 @@ fn exec_no_limit(exec_entry: f64, price_buf: f64) -> f64 {
 }
 #[cfg_attr(not(test), allow(dead_code))]
 fn exec_count(stake: f64, exec_entry: f64, max_count: i64) -> f64 {
-    (stake / exec_entry).round().clamp(1.0, max_count as f64)
+    (stake / exec_entry).round().clamp(1.0, max_count.max(1) as f64)
 }
 /// Fail-open telemetry filter — same sanity band the legacy ask path applies.
-#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
 fn filtered_ask(ask: Option<f64>) -> Option<f64> {
     ask.filter(|v| *v > 0.50 && *v <= 0.98)
 }
@@ -2591,7 +2587,15 @@ mod tests {
         .await;
         assert_eq!(quick.unwrap().unwrap(), 0.85);
     }
+    // review MINOR-1: a misconfigured MAX_COUNT<1 must not panic the trading task.
+    #[test]
+    fn count_helpers_survive_bad_max_count() {
+        assert_eq!(signal_count(5.0, 0.8, 0), 1.0);
+        assert_eq!(signal_count(5.0, 0.8, -3), 1.0);
+        assert_eq!(exec_count(5.0, 0.8, 0), 1.0);
+    }
 }
+
 
 
 
