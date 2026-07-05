@@ -100,6 +100,9 @@ pub struct Dash {
     pub triggers: Vec<TrigSummary>,
     pub paper: Vec<PaperTrade>,
     pub paper_updated: String,
+    /// second paper series (f1_d50cap75) pushed via POST /paper_f1 — comparison line
+    pub paper_f1: Vec<PaperTrade>,
+    pub paper_f1_updated: String,
     /// triggers from the SECOND shadow (EU box, Binance.com feed), pushed via POST /shadow_com
     pub shadow_com: Vec<TrigSummary>,
     pub shadow_com_updated: String,
@@ -190,6 +193,33 @@ impl Dash {
         })
     }
 
+    fn paper_f1_agg(&self) -> serde_json::Value {
+        let cut = self.started_iso.as_str();
+        let pp: Vec<&PaperTrade> = self
+            .paper_f1
+            .iter()
+            .filter(|t| t.window_start.as_str() >= cut)
+            .collect();
+        let n = pp.len();
+        let res: Vec<&PaperTrade> = pp
+            .iter()
+            .copied()
+            .filter(|t| t.result.as_deref().map(|r| !r.is_empty()).unwrap_or(false))
+            .collect();
+        let rn = res.len();
+        let wins = res
+            .iter()
+            .filter(|t| t.result.as_deref() == Some("WIN") || t.pnl.map(|p| p > 0.0).unwrap_or(false))
+            .count();
+        let total_pnl: f64 = res.iter().filter_map(|t| t.pnl).sum();
+        json!({
+            "positions": n, "resolved": rn, "wins": wins,
+            "win_rate": if rn>0 {r1(100.0*wins as f64/rn as f64)} else {0.0},
+            "total_pnl": r2(total_pnl),
+            "updated": self.paper_f1_updated,
+        })
+    }
+
     /// Per-window side-by-side of shadow trigger vs paper trade.
     fn compare(&self) -> Vec<serde_json::Value> {
         use std::collections::BTreeMap;
@@ -201,6 +231,11 @@ impl Dash {
             }
         }
         for p in &self.paper {
+            if wkey(&p.window_start) >= cut {
+                keys.insert(wkey(&p.window_start), ());
+            }
+        }
+        for p in &self.paper_f1 {
             if wkey(&p.window_start) >= cut {
                 keys.insert(wkey(&p.window_start), ());
             }
@@ -217,6 +252,7 @@ impl Dash {
                 let s = self.triggers.iter().find(|t| wkey(&t.window_start) == *w);
                 let p = self.paper.iter().find(|t| wkey(&t.window_start) == *w);
                 let c = self.shadow_com.iter().find(|t| wkey(&t.window_start) == *w);
+                let f1 = self.paper_f1.iter().find(|t| wkey(&t.window_start) == *w);
                 let match_us = match (s, p) {
                     (Some(s), Some(p)) => Some(s.side.eq_ignore_ascii_case(&p.side)),
                     _ => None,
@@ -253,6 +289,11 @@ impl Dash {
                     "com_result": c.and_then(|x| x.result.clone()),
                     "com_won": c.and_then(|x| x.won),
                     "com_ts": c.map(|x| x.ts_iso.clone()),
+                    "f1_side": f1.map(|x| x.side.to_uppercase()),
+                    "f1_entry": f1.map(|x| x.entry_price),
+                    "f1_pnl": f1.and_then(|x| x.pnl),
+                    "f1_p": f1.and_then(|x| x.p_model),
+                    "f1_result": f1.and_then(|x| x.result.clone()),
                 })
             })
             .collect();
@@ -285,6 +326,7 @@ impl Dash {
             "live_com_updated": self.live_com_updated,
             "agg": self.agg(),
             "paper_agg": self.paper_agg(),
+            "paper_f1_agg": self.paper_f1_agg(),
             "compare": cmp,
             "summary": {
                 "us_match": us_ok, "us_total": us_n, "us_pct": pct(us_ok, us_n),
@@ -335,7 +377,22 @@ pub async fn serve(dash: Arc<Mutex<Dash>>, port: u16) {
                 None => return,
             };
             let bad_token = !token.is_empty() && hdr_token != token;
-            let (status, ctype, out) = if method == "POST" && path.starts_with("/paper") {
+            let (status, ctype, out) = if method == "POST" && path == "/paper_f1" {
+                if bad_token {
+                    ("403 Forbidden", "text/plain", "bad token".to_string())
+                } else {
+                    match serde_json::from_str::<Vec<PaperTrade>>(&body) {
+                        Ok(trades) => {
+                            let n = trades.len();
+                            let mut d = dash.lock().unwrap();
+                            d.paper_f1 = trades;
+                            d.paper_f1_updated = d.live.updated_iso.clone();
+                            ("200 OK", "application/json", json!({"ok": true, "n": n}).to_string())
+                        }
+                        Err(e) => ("400 Bad Request", "text/plain", format!("parse: {e}")),
+                    }
+                }
+            } else if method == "POST" && path.starts_with("/paper") {
                 if bad_token {
                     ("403 Forbidden", "text/plain", "bad token".to_string())
                 } else {
@@ -516,7 +573,7 @@ function initChart(){
  });
  const mk=(c,t)=>_chart.addLineSeries({color:c,lineWidth:2,title:t,priceLineVisible:false,lastValueVisible:true,
    priceFormat:{type:'custom',formatter:v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(0)}});
- _S.paper=mk('#e3a008','paper'); _S.com=mk('#3fb950','COM'); _S.us=mk('#58a6ff','US');
+ _S.paper=mk('#e3a008','paper'); _S.com=mk('#3fb950','COM'); _S.us=mk('#58a6ff','US'); _S.f1=mk('#f778ba','F1');
  // zero baseline
  _S.paper.createPriceLine({price:0,color:'#555',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
@@ -592,6 +649,7 @@ function updateChart(cmp){
  for(const r of cmp){
   r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
   r.com_twin=(r.com_pnl!=null&&r.com_entry)?twin5(r.com_entry,(r.com_won!=null?r.com_won:r.com_pnl>0)):null;
+  r.f1_twin=(r.f1_pnl!=null&&r.f1_entry)?twin5(r.f1_entry,r.f1_pnl>0):null;
  }
  const rows=cmp.slice().reverse();
  // gate=true would accumulate only on both-resolved windows; we plot ungated full history.
@@ -603,9 +661,9 @@ function updateChart(cmp){
  // Both lines run identical $5 Kalshi economics (integer contracts, Kalshi fee on win+loss,
  // loss=-cost) via twin5 on each side's own fill entry, so the remaining paper-vs-LIVE gap is
  // ONLY real slippage + no-fills, never a stake-scale artifact. US shadow dropped.
- _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin'));
+ _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin')); _S.f1.setData(build('f1_twin'));
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length;
- document.getElementById('chartlbl').textContent=`(uniform $5 · paper-twin ${money(tot('pa_twin'))} over ${paw}w  vs  LIVE/shadow ${money(tot('com_twin'))} over ${cow}w · gap = slippage + no-fills · real-money total → cards above)`;
+ document.getElementById('chartlbl').textContent=`(uniform $5 · paper-twin ${money(tot('pa_twin'))} over ${paw}w  vs  LIVE/shadow ${money(tot('com_twin'))} over ${cow}w  vs  F1-twin ${money(tot('f1_twin'))} · gap = slippage + no-fills · real-money total → cards above)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
@@ -615,13 +673,14 @@ async function load(){
  document.getElementById('sub').textContent=`signal ${L.updated_iso} · ${feedlbl} · since ${d.started} · LIVE push ${d.live_com_updated||'—'} · paper ${d.paper_agg.updated||'—'}`;
  // ===== authoritative REAL money (pushed from the bot, fees+slippage in) + period paper-vs-live =====
  const lc=d.live_com||{};
- let pT=0,pL=0,nL=0,wL=0;
- for(const c of d.compare){ if(c.pa_pnl!=null&&c.pa_entry){pT+=twin5(c.pa_entry,c.pa_pnl>0);} if(c.com_pnl!=null&&c.com_entry){pL+=twin5(c.com_entry,(c.com_won!=null?c.com_won:c.com_pnl>0));nL++;if(c.com_pnl>0)wL++;} }
+ let pT=0,pL=0,nL=0,wL=0,f1T=0;
+ for(const c of d.compare){ if(c.pa_pnl!=null&&c.pa_entry){pT+=twin5(c.pa_entry,c.pa_pnl>0);} if(c.com_pnl!=null&&c.com_entry){pL+=twin5(c.com_entry,(c.com_won!=null?c.com_won:c.com_pnl>0));nL++;if(c.com_pnl>0)wL++;} if(c.f1_pnl!=null&&c.f1_entry){f1T+=twin5(c.f1_entry,c.f1_pnl>0);} }
  const edge=pT!=0?Math.round(100*pL/pT):0;
  document.getElementById('realpnl').innerHTML=
    card('💵 LIVE real · ALL-TIME',money(lc.total_pnl),rc(lc.total_pnl),true)
   +card('LIVE real · today',money(lc.day_pnl),rc(lc.day_pnl),true)
   +card('paper $5-twin (period)',money(pT),rc(pT))
+  +card('F1 $5-twin (period)',money(f1T),rc(f1T))
   +card('LIVE (period)',`${money(pL)} · ${nL}w · WR ${nL?Math.round(100*wL/nL):0}%`,rc(pL))
   +card('live = % of paper',pT!=0?`${edge}%`:'—',edge>=90?'green':edge>=70?'yellow':'red');
  document.getElementById('match').innerHTML=
