@@ -6,7 +6,7 @@ with a fixed structure: description, user story, functional requirements,
 non-functional requirements, acceptance criteria, affected endpoints, schema
 changes, and UI changes. Sections cross-reference each other by number.
 
-- **Version:** 0.2
+- **Version:** 0.3
 - **Last updated:** 2026-07-05
 - **Owner:** trading-bot maintainers
 
@@ -549,3 +549,342 @@ Documented honestly, per the operator's explicit instruction:
   `threshold_gap = 0.1` but the Rust gate has no such logic. FR-8 must resolve
   whether this is a real entry-affecting parameter (parity gap) or inert for the
   pmodel path before go-live.
+
+---
+
+## 3. Dashboard — Separate LIVE F1 Line + LIVE Table/Cards
+
+Internal id: `dashboard-f1-live-line`. A **dashboard-only** feature (chart + table +
+cards) that splits the single "shadow/LIVE" series into **two** distinct series — a
+**real-fill LIVE line** and a **strategy shadow twin line** — so execution
+divergence (slippage, no-fills, fees) is visible while `f1_d50cap75` trades LIVE.
+Cross-references Section 1 (`live-exec-telemetry-latch-fix`) for `LiveTriggerRecord`,
+`Pending.live`, and the window latch, and Section 2 (`live-f1-strategy`) for the
+`/shadow_com` (green) and `/paper_f1` (pink) series. **This section supersedes the
+Section 2.5 AC-7 / 2.8 assumption that "no dashboard change is required"** — that
+assumption held only while the green line was an honest shadow; under
+`LIVE_TRADING=1` it silently became the live line (see 3.1).
+
+### 3.1 Feature description
+
+The Buffalo dashboard (`kalshi_rs/src/dashboard.rs`, served at `:8890`) charts
+cumulative `$5`-normalized PnL lines built by the chart JS (`dashboard.rs` ≈ lines
+641-667): **orange** `pa_twin` (paper f6 `$5`-twin), **pink** `#f778ba` `f1_twin`
+(paper F1 `$5`-twin, `POST /paper_f1`), **green** `#3fb950` `com_twin` ("COM" shadow,
+`POST /shadow_com` from the EU bot), and **blue** `#58a6ff` `us` (Buffalo's own
+binance.US shadow, from `self.triggers`). The green series and the per-window table's
+`com_*` columns are both fed by the EU bot's `dash.triggers`, which it POSTs to
+`/shadow_com` (`dashboard.rs` ≈ lines 410-423; producer `main.rs` ≈ lines 657-693).
+
+**The defect.** In `signal_loop` (`main.rs` ≈ lines 1124-1174) the shadow path
+(`emit_trigger`, the `else` branch at ≈ lines 1167-1173) and the real-order path
+(`place_live`, ≈ lines 1133-1166) are **mutually exclusive**. With
+`LIVE_TRADING=1`, only `place_live` runs, so the EU bot's `dash.triggers` — and
+therefore `/shadow_com`, the green line, and the `com_*` table columns — contains
+**only live fills**. The line labelled "shadow/COM" silently became the **live**
+line, and there is **no strategy-level shadow line at all**. Because live fills size
+at `STAKE=$5` while the historical shadow (`emit_trigger`) sizes at `cfg.stake=$100`
+(`main.rs` ≈ line 1197), the two were also on different money scales — the earlier
+`twin5` normalization (`dashboard.rs` ≈ lines 562-563, 641-666) papered over the
+scale but could not restore the missing shadow line.
+
+**This feature.** (a) Add a **separate LIVE line** (real fills), anchored to **start
+at the pink `f1_twin` cumulative value at the window just before the first live
+fill**, so execution divergence from the paper F1 signal is visible; the LIVE line
+plots **raw `$5` money** (no `twin5` re-pricing). (b) Restore the **green line to a
+true SHADOW** (strategy would-be orders, `emit_trigger`) as in the f6 era, by having
+the EU bot emit an honest shadow twin **in addition to** each live order. (c) In the
+per-window table, replace the middle **"US (binance.us)"** column with a **LIVE**
+column (real entries: side / entry / Δ / result), and replace the **"US ↔ paper
+side-match"** summary cards with **LIVE** metrics.
+
+The mechanism is a single boolean, `live`, threaded through the shared `TrigSummary`
+struct: the EU bot tags real fills `live=true` and shadow twins `live=false`; the
+same `dash.triggers` vector (already POSTed to `/shadow_com`) then carries both, and
+the Buffalo `compare()` splits them by the flag. Both boxes run the **same**
+`dashboard.rs`, so the struct and split live in one codebase.
+
+### 3.2 User story
+
+As the **operator watching the Buffalo dashboard**, I want the real LIVE F1 fills on
+their **own** cumulative line — anchored to the paper-F1 pink line at the moment live
+trading began — and I want the green line to go back to being the honest strategy
+**shadow** (would-be orders), so that I can see at a glance how much real execution
+(slippage, no-fills, fees) diverges from the paper F1 signal, instead of a single
+mislabelled line that conflates the two.
+
+### 3.3 Functional requirements
+
+**A. Shared `TrigSummary` schema (one struct, both boxes)**
+
+1. Add a field `live: bool` with `#[serde(default)]` to `TrigSummary`
+   (`kalshi_rs/src/dashboard.rs` ≈ lines 48-74). Back-compat: old `/shadow_com`
+   pushes and old ledger replays that lack the key MUST deserialize to `false`
+   (all such rows are treated as shadow). No existing `TrigSummary` field is renamed
+   or removed. The struct is shared verbatim by both the EU producer and the Buffalo
+   consumer (single codebase).
+
+**B. EU producer — tag fills LIVE, emit an honest shadow twin (`main.rs`)**
+
+2. `place_live`'s `TrigSummary` push (`main.rs` ≈ lines 1502-1515) MUST set
+   `live: true`. Its `Pending{ live: true }` (≈ lines 1516-1526) is unchanged; its
+   order/pricing/sizing logic is unchanged (Section 1 & 2 rails intact).
+3. In the **live branch** of `signal_loop` (`main.rs` ≈ lines 1133-1166), the EU bot
+   MUST **additionally** emit the honest shadow twin — a call to `emit_trigger` (the
+   would-be order at the **signal** entry, `live=false`) **exactly once per window**,
+   gated by a **dedicated `twin_window` latch** that is a sibling of the existing
+   `fired_window` / `attempt_window` state and is reset on window roll (mirroring
+   `main.rs` ≈ lines 1126-1130). The twin latch MUST **not** depend on `place_live`'s
+   fill / no-fill / skip / retry outcome — the twin fires once per window
+   **regardless** of what the live order did, so the shadow line exists even when the
+   live order no-filled or was capped. `place_live`'s own latch (`fired_window`) and
+   order logic are unchanged.
+4. `emit_trigger`'s `TrigSummary` push (`main.rs` ≈ lines 1261-1274) MUST set
+   `live: false`. `emit_trigger` continues to write a `TriggerRecord` (which has **no**
+   `live` field → a shadow row on replay), push `Pending{ live: false }` (≈ line
+   1257), and its Pending is scored on the **real** Kalshi settlement by the existing
+   resolver. Its `$100` sizing (`cfg.stake / fire.entry`, `main.rs` ≈ line 1197) is a
+   **known artifact** and is **NOT changed** by this feature — the twin's raw PnL is
+   `$100`-scale and is `twin5`-normalized on the chart (see FR-13).
+5. The **non-live `else` branch** (`main.rs` ≈ lines 1167-1173; Buffalo / shadow-only
+   boxes) is unchanged: it keeps the `fired_window` latch and `emit_trigger`, whose
+   `TrigSummary` now carries `live: false` per FR-4.
+
+**C. Ledger replay + resolve disambiguation (`main.rs`, `dashboard.rs`, `ledger.rs`)**
+
+6. `replay_line_into`'s trigger push (`main.rs` ≈ lines 346-359) MUST set `live` from
+   the row's `live` field: a `LiveTriggerRecord` (`live: true`, `ledger.rs` ≈ lines
+   144, 208) → `true`; a legacy `TriggerRecord` (no `live` key) → `false`. This
+   preserves the live/shadow split across restarts (Section 1 FR-5, additive-JSON).
+7. `Dash::resolve()` (`dashboard.rs` ≈ lines 121-131) MUST gain a `live: bool`
+   parameter and add `t.live == live` to its match predicate (currently `ticker` +
+   `side` + `entry` within 1e-9 + `result.is_none()`). With a twin row (`entry =
+   signal_entry`, `live=false`) and a live row (`entry = eff`, `live=true`) whose
+   entries can be **EQUAL** when slippage is zero (`eff == signal_entry`), the flag
+   ensures a twin resolve updates the twin row and a live resolve updates the live
+   row — attaching the correct (`$100`-scale vs `$5`-scale) PnL to each.
+8. The runtime resolver (`main.rs` ≈ lines 874-881) MUST pass `pd.live` into
+   `Dash::resolve()`. `pd.live` is already available (`Pending.live`, `main.rs` ≈
+   line 383; consumed at ≈ line 859).
+9. `ResolveRecord` (`kalshi_rs/src/ledger.rs` ≈ lines 86-98) MUST gain an additive
+   `live: bool` field, written by the resolver from `pd.live` (≈ line 846), so the
+   **replay** resolve branch (`main.rs` ≈ lines 362-369) can pass the correct flag to
+   `Dash::resolve()` (FR-7). This is required for FR-6's "restarts preserve the split"
+   to hold when `eff == signal_entry`. Additive/back-compat: replay parses via
+   `serde_json::Value` (`v["live"].as_bool()`), so old resolve rows without the key
+   read as `false`. No change to `TriggerRecord` or `LiveTriggerRecord`.
+
+**D. Buffalo `compare()` split by the `live` flag (`dashboard.rs`)**
+
+10. `compare()` (`dashboard.rs` ≈ lines 224-302) MUST source the existing `com_*`
+    fields (`com_side`, `com_entry`, `com_delta`, `com_pnl`, `com_result`, `com_won`,
+    `com_count`, `com_p`, `com_ticker`, `com_ts`) **only** from `live=false`
+    `shadow_com` entries (the strategy shadow twin), and MUST add **new `lv_*`
+    fields** — `lv_side`, `lv_entry`, `lv_delta`, `lv_pnl`, `lv_result`, `lv_won`,
+    `lv_count`, `lv_p` — sourced **only** from `live=true` `shadow_com` entries (real
+    fills). Per window: the twin populates `com_*`, the live fill populates `lv_*`; a
+    window with only a shadow entry leaves `lv_*` null and vice-versa.
+11. `compare()` MUST add `match_lv` = live side vs **paper-F1** side (`f1_side`,
+    already computed at `dashboard.rs` ≈ line 292) for windows where both a live fill
+    and a paper-F1 trade exist (analogous to the existing `match_com`, ≈ lines
+    260-263).
+12. `body_json()` (`dashboard.rs` ≈ lines 304-340) MUST add LIVE summary aggregates
+    to the `summary` object: `lv_match` / `lv_total` (from `match_lv`), `lv_pct`,
+    `lv_positions` (count of `live=true` `shadow_com` rows in-period, i.e.
+    `window_start >= started_iso`), and `lv_pnl` (sum of **raw** `lv_pnl` in-period).
+    The existing `com_*` summary fields are retained. Summary additions are additive
+    (old view keys unchanged).
+
+**E. Chart JS — new LIVE line, restore green as shadow (`dashboard.rs` HTML/JS)**
+
+13. The **green** line MUST remain `com_twin` (the `twin5`-normalized shadow twin,
+    `dashboard.rs` ≈ lines 651, 664), restored to its f6-era meaning of "strategy
+    would-be orders". Orange stays `pa_twin`, pink stays `f1_twin`.
+14. A **new LIVE line** MUST be added (suggested color `#ff7b72`; distinct from
+    green `#3fb950`, pink `#f778ba`, orange `#e3a008`, blue `#58a6ff`) whose value =
+    **anchor + cumulative RAW `lv_pnl`** (real `$5` money — **NO** `twin5`
+    re-pricing; see NFR-5). The line MUST be plotted **only from the first live-fill
+    window onward** — no leading zero tail before the first live fill.
+15. The LIVE line's **anchor** MUST equal the pink `f1_twin` **cumulative** value at
+    the window **immediately before** the first live-fill window (the pink cumulative
+    just prior to the first `lv_*` window). From that anchor the line steps by raw
+    `lv_pnl` per subsequent live window.
+16. The hover tooltip (`renderTip`, `dashboard.rs` ≈ lines 624-640) MUST gain a
+    distinct **LIVE** segment (real fill: side / entry / Δ / p / result / **raw**
+    `lv_pnl`) separate from the existing shadow-twin segment (`com_*`). The chart
+    header (`dashboard.rs` ≈ line 538) and the `chartlbl` summary text (≈ line 666)
+    MUST be updated to name the LIVE line alongside the shadow line.
+
+**F. Table + cards — US column → LIVE, US cards → LIVE metrics (`dashboard.rs` HTML/JS)**
+
+17. The per-window table MUST **remove the middle "US (binance.us)" column** (the
+    `us_side` / `us_entry` / `us_delta` / `match_us` group) from the rendered header
+    (`dashboard.rs` ≈ lines 545-549) and rows (≈ lines 698-702), and add a **LIVE**
+    column sourced from `lv_*` (side / entry / Δ / `=pa` where `=pa` renders
+    `match_lv` vs paper-F1). The existing shadow column (`com_*`) is **retained** and
+    relabelled to reflect it is the **strategy shadow twin** (not "LIVE"). Buffalo's
+    own binance.US triggers (`self.triggers`) MAY remain in the `/stats` JSON but MUST
+    NOT be rendered in the table.
+18. The summary cards MUST **remove** the "US ↔ paper side-match" and "US: matched /
+    windows" cards (`dashboard.rs` ≈ lines 687-688) and add **LIVE↔paper-F1** cards:
+    side-match % (`lv_pct`), fills count (`lv_positions`), and **live-period real
+    PnL** (raw `lv_pnl`). The realpnl "LIVE (period)" card (≈ lines 683-685) MUST
+    source from **raw** `lv_pnl` (real `$5`), not from `com_*` `twin5`. The shadow
+    (`com_*`) side-match cards are retained, relabelled **SHADOW**.
+
+### 3.4 Non-functional requirements
+
+1. **Wire back-compat (additive serde).** `POST /paper`, `POST /paper_f1`, and
+   `POST /shadow_com` wire formats stay backward-compatible: the only change is the
+   additive `TrigSummary.live` (`#[serde(default)]`, FR-1). Old `/shadow_com` payloads
+   that lack the `live` field MUST still parse and render — every such row is treated
+   as shadow (`live=false`). No endpoint is added or removed (Section 3.6).
+2. **No f6-era / shadow-only regression.** When the `shadow_com` feed contains only
+   `live=false` rows (a pre-live period, or a shadow-only box such as Buffalo's local
+   view before EU pushes live rows), the dashboard MUST render equivalently to the
+   pre-feature shadow view: the green `com_twin` line and the shadow match cards
+   behave as before; `lv_*` is empty, and the LIVE line / LIVE column / LIVE cards are
+   simply absent (no live rows to plot). No parse errors on a mixed or all-shadow feed.
+3. **Single source of truth.** Both boxes MUST be rebuilt from the **same**
+   `dashboard.rs`; the `TrigSummary` struct and the `compare()` split are shared, not
+   forked per box. The EU box is the producer of the `live` flag; Buffalo is the
+   consumer.
+4. **EU restart safety.** The EU restart is protected by the existing window latch
+   (Section 1 FR-7 latch-on-confirmed-fill + persisted `live_state`), so a restart
+   does not re-place a live order for an already-filled window; the new `twin_window`
+   latch (FR-3) is an in-memory sibling reset on window roll, consistent with
+   `attempt_window` (`main.rs` ≈ lines 1126-1130), so the shadow twin is emitted at
+   most once per live window under steady-state operation.
+5. **Raw-money integrity of the LIVE line.** The LIVE line MUST plot **raw** `lv_pnl`
+   (actual `$5` fills) and MUST NOT be `twin5`-re-priced — `twin5` re-pricing is what
+   the earlier fix (commit `c5a0a98`) used to kill the `$5`-vs-`$100` scale artifact
+   **on the shadow line**, and it is correct there because the shadow sizes at `$100`;
+   applying it to real `$5` fills would misstate real money. The green shadow line
+   remains `twin5`-normalized.
+6. **No new hot-path cost.** The producer change adds one `emit_trigger` call per
+   window (already the shadow-mode cost) plus a boolean; no new network I/O on the
+   0.3 s decision loop. The consumer change is pure in-memory partitioning of an
+   already-received vector.
+
+### 3.5 Acceptance criteria
+
+1. **Old JSON deserializes to shadow.** A `TrigSummary` JSON object with **no**
+   `live` key deserializes with `live == false` (unit test).
+2. **Resolve disambiguation (equal entries).** Given two `dash.triggers` rows sharing
+   `(ticker, side, entry)` but differing in `live`, both with `result == None`,
+   `Dash::resolve(.., live=true, ..)` updates **only** the `live=true` row and
+   `Dash::resolve(.., live=false, ..)` updates **only** the `live=false` row — proven
+   with a unit test using **equal** `entry` values.
+3. **`compare()` split is exclusive.** In `compare()` output, `lv_*` fields are
+   populated **only** for windows that have a `live=true` `shadow_com` entry, and
+   `com_*` **only** for `live=false` entries. A window with both yields both `com_*`
+   (twin) and `lv_*` (live); a window with only a `live=false` entry yields `lv_*`
+   null.
+4. **Green line contains no live fills.** While `LIVE_TRADING=1`, the green
+   (`com_twin`) line's cumulative sum is taken over `live=false` `shadow_com` rows
+   only — verifiable because the green line's window count equals the count of
+   `live=false` `shadow_com` rows, and excludes every `live=true` fill.
+5. **LIVE line anchor.** The LIVE line's **first** plotted point value equals the pink
+   `f1_twin` cumulative value at the window immediately **before** the first live-fill
+   window; each later point adds raw `lv_pnl`. No LIVE point is plotted before the
+   first live-fill window (no zero tail).
+6. **Table shows LIVE instead of US.** The rendered per-window table shows a **LIVE**
+   column (from `lv_*`) in the slot previously occupied by the US(binance.us) column;
+   `us_*` and `match_us` are absent from the rendered rows. `self.triggers` may still
+   appear in the `/stats` JSON payload.
+7. **Cards show LIVE metrics.** The "US ↔ paper side-match" and "US: matched /
+   windows" cards are replaced by LIVE↔paper-F1 cards (side-match % = `lv_pct`, fills
+   count = `lv_positions`, live-period real PnL from raw `lv_pnl`); the shadow
+   (`com_*`) match cards remain.
+8. **Restart preserves the split.** Replaying a ledger that contains, for one window,
+   both a live fill (`LiveTriggerRecord`, `live:true`) and its shadow twin
+   (`TriggerRecord`) plus their two resolve rows reconstructs **two distinct**
+   `dash.triggers` rows with correct `live` flags, and each resolve attaches to the
+   correct row (live resolve → live row with `$5`-scale PnL; twin resolve → twin row
+   with `$100`-scale PnL) **even when** `eff == signal_entry` — verified over a mixed
+   JSONL fixture.
+9. **Shadow-only view unchanged.** With a `shadow_com` feed of only `live=false` rows,
+   the dashboard renders the green `com_twin` line and the shadow cards as in the
+   pre-feature view, with no LIVE line, no LIVE column, and no LIVE cards, and no
+   parse errors (NFR-2).
+
+### 3.6 Affected endpoints
+
+Internal Rust binary — **no new HTTP routes** are created. Existing dashboard
+endpoints, only additive changes:
+
+- `POST /shadow_com` (`dashboard.rs` ≈ lines 410-423) — the request payload (a JSON
+  array of `TrigSummary`) gains the additive `live` field per element (FR-1). Older
+  payloads without it still parse (NFR-1). The producer is the EU push loop
+  (`main.rs` ≈ lines 657-693), unchanged in transport.
+- `GET /stats` (`dashboard.rs` ≈ lines 441-442, body from `body_json`) — the JSON
+  output gains the `compare[].lv_*` fields, `compare[].match_lv`, and the
+  `summary.lv_*` aggregates (FR-10..12). Existing keys are unchanged.
+- `POST /paper`, `POST /paper_f1`, `POST /live_com` — **unchanged**.
+
+### 3.7 Schema changes
+
+No SQL database. The "schema" is the append-only JSONL ledger record shapes plus the
+`/shadow_com` and `/stats` wire shapes. All changes are **additive** and
+backward-compatible:
+
+- **`TrigSummary.live: bool`** (`kalshi_rs/src/dashboard.rs`) — additive,
+  `#[serde(default)]` → absent reads as `false` (FR-1). This is both the `/shadow_com`
+  wire field and the in-memory field.
+- **`ResolveRecord.live: bool`** (`kalshi_rs/src/ledger.rs` ≈ lines 86-98) — additive,
+  written from `pd.live` (FR-9); replay parses via `serde_json::Value`, so old resolve
+  rows without it read as `false`.
+- **No change** to `TriggerRecord` (`ledger.rs` ≈ lines 48-82) or `LiveTriggerRecord`
+  (`ledger.rs` ≈ lines 142-186; its `live` field already exists, always `true`).
+- **No change** to `Pending` (`main.rs` ≈ lines 375-384; `live` already present) or to
+  the `PaperTrade` shape.
+
+### 3.8 UI changes
+
+Yes — chart, table, and cards on the Buffalo dashboard (`dashboard.rs` HTML/JS block,
+≈ lines 511-706):
+
+- **Chart:** add a new **LIVE line** (`#ff7b72`) = anchor + cumulative raw `lv_pnl`,
+  plotted from the first live window (FR-14, FR-15); restore the **green** line to the
+  `com_twin` shadow (FR-13); add a **LIVE** tooltip segment and update the chart
+  header + `chartlbl` label (FR-16).
+- **Table:** replace the middle **US (binance.us)** column with a **LIVE** column
+  (`lv_*`: side / entry / Δ / `=pa`), and relabel the retained shadow (`com_*`) column
+  as the strategy shadow twin (FR-17).
+- **Cards:** replace the two **US ↔ paper** cards with **LIVE↔paper-F1** cards
+  (side-match %, fills count, live-period real PnL); the realpnl "LIVE (period)" card
+  sources from raw `lv_pnl`; the shadow (`com_*`) cards are retained, relabelled
+  SHADOW (FR-18).
+
+### 3.9 Out of scope
+
+- Changing `emit_trigger`'s `$100` sizing / `cfg.stake` (the twin stays `$100`,
+  `twin5`-normalized on the chart — a known artifact, FR-4).
+- Any new HTTP route or endpoint (only additive fields on `/shadow_com` and `/stats`).
+- Rendering Buffalo's own binance.US shadow (`self.triggers`) — it is removed from the
+  UI table/cards but may remain in the `/stats` JSON (FR-17).
+- Any strategy, pricing, sizing, or order-flow change — Section 1 and Section 2 rails
+  (telemetry, latch-on-fill, bounded retry, MIRROR gate, subaccount isolation) are
+  unchanged.
+- SQL schema, us-east co-location, WebSocket orderbook feed, modeled paper twin
+  (out of scope per Sections 1.9 / 2.9).
+
+### 3.10 Risks and open questions
+
+- **Twin double-emit on mid-window restart.** The `twin_window` latch (FR-3) is
+  in-memory and resets on restart. A restart mid-window could emit a second shadow
+  twin for the same window; the live order is still protected by the persisted window
+  latch (NFR-4), but the twin (`Pending{live:false}`) is not persisted. The planner
+  MUST decide whether a duplicate twin per restarted window is acceptable (it is a
+  shadow row, `$100`-scale, twin5-normalized) or whether the twin latch should reuse
+  the same persistence as `fired_window`.
+- **Anchor when pink is sparse.** If paper-F1 (`/paper_f1`) has **no** resolved trade
+  in the window immediately before the first live fill, the anchor "pink cumulative
+  just prior" MUST be defined precisely (the running `f1_twin` cumulative at the last
+  window with a value at or before the first live window, defaulting to `0` if none).
+  The chart JS MUST specify this to avoid an undefined/`null` anchor.
+- **`match_lv` denominator.** LIVE↔paper-F1 side-match (FR-11) is only defined for
+  windows where **both** a live fill and a paper-F1 trade exist; windows where the
+  live order no-filled (no `lv_*`) or paper-F1 did not trade are excluded from the
+  denominator — the card copy MUST make the denominator explicit to avoid misreading
+  the percentage as coverage.
