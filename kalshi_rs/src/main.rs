@@ -92,7 +92,6 @@ fn display_sigma(sigmas: &std::collections::HashMap<String, f64>, cfg: &SessionC
     sigmas.get(&cfg.sigma_type).copied().unwrap_or(0.0)
 }
 
-const SESSION_NAME: &str = "f6_wait270_shadow";
 const LEDGER_PATH: &str = "shadow_ledger.jsonl";
 
 fn now_secs() -> f64 {
@@ -198,6 +197,7 @@ pub(crate) fn retry_gate(attempt_count: i64, last_attempt_ts: f64, now: f64, n: 
 /// entry goes into the additive `signal_entry` field so `gap = eff - signal_entry`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_fill_record(
+    session: &str,
     outcome: Outcome,
     ts: f64,
     ts_iso: String,
@@ -224,7 +224,7 @@ pub(crate) fn build_fill_record(
         outcome,
         ts,
         ts_iso,
-        SESSION_NAME.to_string(),
+        session.to_string(),
         window_start,
         window_end,
         market_ticker,
@@ -258,6 +258,7 @@ pub(crate) fn build_fill_record(
 /// Callers set whatever order fields apply to their path before appending.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_context_record(
+    session: &str,
     outcome: Outcome,
     ts: f64,
     ts_iso: String,
@@ -274,7 +275,7 @@ pub(crate) fn build_context_record(
         outcome,
         ts,
         ts_iso,
-        SESSION_NAME.to_string(),
+        session.to_string(),
         window_start,
         window_end,
         market_ticker,
@@ -673,11 +674,15 @@ async fn main() -> Result<()> {
         let led = ledger.clone();
         let dsh = dash.clone();
         let ls = live_state.clone();
-        tokio::spawn(async move { resolver(rc, pend, led, dsh, ls).await });
+        tokio::spawn(async move { resolver(rc, pend, led, dsh, ls, session_sel).await });
     }
 
     // 4) Signal loop @ 0.3s
-    signal_loop(state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http, rest).await;
+    signal_loop(
+        state, ledger, pending, cfg, dash, order_client, lcfg, live_state, mcfg, http, rest,
+        session_sel,
+    )
+    .await;
     Ok(())
 }
 
@@ -774,7 +779,9 @@ async fn resolver(
     ledger: Arc<Ledger>,
     dash: Arc<Mutex<Dash>>,
     live_state: Arc<Mutex<LiveState>>,
+    sel: SessionSel,
 ) {
+    let session_tag = sel.session_tag();
     loop {
         tokio::time::sleep(Duration::from_secs(20)).await;
         let now = Utc::now();
@@ -798,7 +805,7 @@ async fn resolver(
                             kind: "resolve",
                             ts: now_secs(),
                             ts_iso: now.to_rfc3339(),
-                            session: SESSION_NAME,
+                            session: &session_tag,
                             market_ticker: &pd.ticker,
                             side: pd.side,
                             entry: pd.entry,
@@ -855,7 +862,9 @@ async fn signal_loop(
     mcfg: MirrorCfg,
     http: reqwest::Client,
     rest: Arc<KalshiRest>,
+    sel: SessionSel,
 ) {
+    let session_tag = sel.session_tag();
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
     let mut fired_window: Option<String> = None;
     let mut last_status_log = 0.0f64;
@@ -947,7 +956,7 @@ async fn signal_loop(
                         last_status_log = now;
                         warn!(
                             "[{}] MIRROR {} — skipping tick (no blind trades)",
-                            SESSION_NAME,
+                            session_tag,
                             if other.is_some() { "STALE" } else { "UNREACHABLE" }
                         );
                     }
@@ -1000,7 +1009,7 @@ async fn signal_loop(
             last_status_log = now;
             info!(
                 "[{}] {} | btc={:.0} Δopen={:?} τ={:.1} e={:.1} σ({})={:.6} mkt={} yes_ask={:?} no_ask={:?}",
-                SESSION_NAME,
+                session_tag,
                 res.reason,
                 price,
                 shared.delta_from_open,
@@ -1096,6 +1105,7 @@ async fn signal_loop(
                             now,
                             now_utc,
                             &rest,
+                            sel,
                         )
                         .await;
                         if counts_as_attempt(outcome) {
@@ -1107,7 +1117,10 @@ async fn signal_loop(
                     }
                 } else {
                     fired_window = win_key.clone();
-                    emit_trigger(&ledger, &pending, &cfg, &shared, &book, &win, &fire, now, now_utc, &dash);
+                    emit_trigger(
+                        &ledger, &pending, &cfg, &shared, &book, &win, &fire, now, now_utc, &dash,
+                        &session_tag,
+                    );
                 }
             }
         }
@@ -1126,6 +1139,7 @@ fn emit_trigger(
     now: f64,
     now_utc: DateTime<Utc>,
     dash: &Arc<Mutex<Dash>>,
+    session_tag: &str,
 ) {
     let side_str = match fire.side {
         Side::Yes => "yes",
@@ -1140,7 +1154,7 @@ fn emit_trigger(
         kind: "trigger",
         ts: now,
         ts_iso: now_utc.to_rfc3339(),
-        session: SESSION_NAME,
+        session: session_tag,
         window_start: w_start,
         window_end: w_end,
         market_ticker: &book.ticker,
@@ -1171,7 +1185,7 @@ fn emit_trigger(
 
     info!(
         "🔫 TRIGGER {} {} @ {:.2} ({} x {}c) Δ={:+.1} p={:?} snr={:.3} τ={:.1} mkt={}",
-        SESSION_NAME,
+        session_tag,
         side_str.to_uppercase(),
         fire.entry,
         count,
@@ -1229,7 +1243,9 @@ async fn place_live(
     now: f64,
     now_utc: DateTime<Utc>,
     rest: &KalshiRest,
+    sel: SessionSel,
 ) -> Outcome {
+    let session_tag = sel.session_tag();
     let side_str: &'static str = match fire.side {
         Side::Yes => "yes",
         Side::No => "no",
@@ -1239,6 +1255,7 @@ async fn place_live(
     // Self-contained (computes window strings on call) so the fill path stays unchanged.
     let ctx = |outcome: Outcome| {
         build_context_record(
+            &session_tag,
             outcome,
             now,
             now_utc.to_rfc3339(),
@@ -1314,7 +1331,8 @@ async fn place_live(
     if count > lcfg.max_count as f64 {
         count = lcfg.max_count as f64;
     }
-    let coid = format!("f6-{}-{}", now_utc.timestamp_millis(), side_str);
+    // coid prefix attributes the fill to the SELECTED strategy on Kalshi's side too
+    let coid = format!("{}{}-{}", sel.coid_prefix(), now_utc.timestamp_millis(), side_str);
     let (mut status, mut resp, mut lat) =
         match oc.create_ioc(&book.ticker, v2side, count, price, coid.clone()).await {
             Ok(x) => x,
@@ -1402,6 +1420,7 @@ async fn place_live(
         Outcome::Filled
     };
     ledger.append(&build_fill_record(
+        &session_tag,
         outcome,
         now,
         now_utc.to_rfc3339(),
@@ -1575,6 +1594,7 @@ mod tests {
     // a simple-fill record: paper entry 0.64, fresh ask 0.66, filled 7 @ 0.70, no re-quote
     fn fill_rec() -> LiveTriggerRecord {
         build_fill_record(
+            "f6_wait270_shadow",
             Outcome::Filled,
             1.0,
             "2026-06-28T12:00:00+00:00".into(),
@@ -1634,6 +1654,7 @@ mod tests {
     fn build_fill_record_partial_count_is_fill() {
         let mut r = fill_rec();
         r = build_fill_record(
+            "f6_wait270_shadow",
             Outcome::Partial,
             r.ts,
             r.ts_iso.clone(),
@@ -1665,6 +1686,7 @@ mod tests {
     #[test]
     fn build_fill_record_requote_has_both_prices() {
         let r = build_fill_record(
+            "f6_wait270_shadow",
             Outcome::Filled,
             1.0,
             "t".into(),
@@ -1698,6 +1720,7 @@ mod tests {
 
     fn ctx_rec(outcome: Outcome) -> LiveTriggerRecord {
         build_context_record(
+            "f6_wait270_shadow",
             outcome,
             1.0,
             "2026-06-28T12:00:00+00:00".into(),
@@ -2024,5 +2047,29 @@ mod tests {
         assert_eq!(display_sigma(&m, &cfg1), 0.0003);
         assert_eq!(display_sigma(&m, &cfg6), 0.0); // no max30 present
     }
+    // ---- slice 5: session attribution threading (live-f1-strategy) ----
+
+    // TC-1.3/TC-5.2/TC-7.7: ledger records carry the SELECTED session tag — F1 rows
+    // must never be mislabeled f6 (replay, dashboards and analytics key on this field).
+    #[test]
+    fn records_tagged_by_selected_session() {
+        let r = build_fill_record(
+            "f1_d50cap75_shadow", Outcome::Filled, 1.0, "t".into(), "ws".into(),
+            "we".into(), "tkr".into(), "yes", 0.8, 0.8, None, 60.0,
+            0.8, 0.86, false, None, 0, 6.0, 0.8, 0.01, 100, "o",
+        );
+        assert_eq!(serde_json::to_value(&r).unwrap()["session"], "f1_d50cap75_shadow");
+        let c = build_context_record(
+            "f1_d50cap75_shadow", Outcome::Nofill, 1.0, "t".into(), "ws".into(),
+            "we".into(), "tkr".into(), "no", 0.7, 0.7, None, -60.0,
+        );
+        assert_eq!(serde_json::to_value(&c).unwrap()["session"], "f1_d50cap75_shadow");
+        // coid shape used by place_live: {prefix}{millis}-{side}
+        let coid = format!("{}{}-{}", SessionSel::F1.coid_prefix(), 123i64, "yes");
+        assert!(coid.starts_with("f1-"));
+        let coid = format!("{}{}-{}", SessionSel::F6.coid_prefix(), 123i64, "yes");
+        assert!(coid.starts_with("f6-"));
+    }
 }
+
 
