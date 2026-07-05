@@ -1,8 +1,38 @@
-## Feature: live-exec-telemetry-latch-fix (P0 telemetry + P0b latch fix)
+## Feature: live-f1-strategy — switch live trader from f6_wait270 to f1_d50cap75, STRAIGHT TO LIVE (user decision 2026-07-05), $5 stake, subaccount #1 ($147.73 there). Plus entry-fidelity audit (maximize signal parity with paper F1).
 
-## Branch: feat/live-exec-telemetry-latch-fix
+## Branch: feat/live-f1-strategy (off feat/dashboard-f1-compare @ 38bee0c)
 
-## Status: 2026-06-30. LIVE TRADING STOPPED (LIVE_TRADING=0, per user) — final real PnL -$131.30. Shadow/paper continue.
+## Status: implementing wave 1 slice 1/9
+
+## Plan (full: .claude/plan-live-f1-strategy.md; PRD §2, use-cases 22UC/96sc, QA all mapped, arch PASS-conditional w/ 8 binding constraints)
+### Wave 1
+- [ ] Slice 1: config.rs resolver+F1 factory+SessionSel (tag/coid/mirror-key) — pending
+- [ ] Slice 2: mirror.rs session param + fail-closed extract_live_sigma (>0.0) — pending [SECURITY pre-review]
+- [ ] Slice 3: docs/audit/live-f1-entry-fidelity.md 7 verdicts (threshold_gap = go-live blocker) — pending
+### Wave 2
+- [ ] Slice 4: main.rs wiring: select_session fail-loud, insert_mirror_sigma under cfg.sigma_type (H2 CRITICAL @868), display re-key 952/992, mirror_key plumbing — pending
+### Wave 3
+- [ ] Slice 5: main.rs attribution threading + coid prefix (@1258 "f6-") — pending
+### Wave 4
+- [ ] Slice 6: main.rs restart latch: LiveState.last_filled_window + boot seed — pending
+### Wave 5
+- [ ] Slice 7 (CONDITIONAL on audit): engine.rs threshold_gap replication — pending
+### Wave 6
+- [ ] Slice 8: tests/f1_regression.rs + full cargo test + clippy -D warnings — pending
+### Wave 7
+- [ ] Slice 9 (OPS): deploy EU box — shadow pre-flight (LIVE_TRADING=0, mirror-gap≈0) THEN flip 1. Env: SESSION+MIRROR_SESSION=f1_d50cap75, STAKE=5, SUBACCOUNT=1, MAX_ENTRY=0.92, DAILY_LOSS_STOP=30 — pending [SECURITY]
+
+## Key facts for this feature (verified 2026-07-05)
+- F1 params (from live_data.db paper_config, NOT in repo): kappa 0.4, delta_threshold 50, p>=0.65, sigma_type max10, entry_wait 3.0min (180s), max_entry 0.92 (name "cap75" LIES — legacy), BOTH sides, liq off, taker, threshold_gap 0.1.
+- $5+fee recompute: F1 +$154.60 full / +$10.68 ex-hot-streak / -$30.14 live-window / +$85.60 post-stop @ 80.2%. Edge thin: WR cushion ~+0.8pt over breakeven. F6 = ~0 cushion.
+- Change points: (1) config.rs new f1_d50cap75() factory or env-param; (2) mirror.rs:74 hardcodes ss.get("f6_wait270") -> parameterize MIRROR_SESSION; (3) main.rs:868 GOTCHA inserts mirrored sigma under hardcoded "max30" key but gate looks up cfg.sigma_type -> with max10 lookup MISSES and silently falls back to realized5 -> must insert under cfg.sigma_type; (4) SESSION env to select strategy.
+- Verified: paper 8893 /api/sessions_state DOES expose f1_d50cap75.live_sigma (max10; 0.000314 vs f6 0.000566 at check time).
+- Audit scope (user asked "выжать приближенность по входам к f1"): mirror freshness, sigma key parity, p-model formula parity (Phi(kappa*snr), tau linear), entry_wait timing (fires at 180s exactly?), threshold_gap semantics diff vs paper, PRICE_BUF=0.06/REQUOTE_BUF=0.12 effect on eff entry, latch/retry P0b, max_entry band.
+- Live config target: LIVE_TRADING=1, STAKE=5, SUBACCOUNT=1, MAX_ENTRY=0.92, MIRROR_SESSION=f1_d50cap75; loss stop: recommend DAILY_LOSS_STOP=30 (subacct has only $147.73; old $100 = 68% of it) — flag to user at deploy.
+- EU box deploy: build on-box ~/.cargo/bin/cargo build --release, systemd kalshi-shadow-com drop-in mirror.conf, backups *.bak.TS.
+
+## (prev feature) Status: 2026-06-30. LIVE TRADING STOPPED (LIVE_TRADING=0, per user) — final real PnL -$131.30. Shadow/paper continue.
+## 2026-06-30 DASHBOARD FIX (commit c5a0a98, fix(ui), deployed to Buffalo kalshi-shadow.service): user caught that the chart compared shadow @ $100 vs paper @ $5. Root cause: config.rs:50 hardcodes cfg.stake=100; STAKE env only feeds live orders (place_live). While LIVE_TRADING=1 green line was real $5 fills; after =0 every would-be (emit_trigger) logs $100 → green line silently jumped scale (3 recent $100 wins masked the gap). Fix: dashboard re-prices the green/com line through twin5($5) on com_entry (same as paper) — 4 spots + header relabel "LIVE/shadow @ $5". Render-only, zero trading change. Verified live: green -$146.50 vs paper -$110.86 (uniform $5). Backups *.bak.20260630-184850 on Buffalo. NOT pushed. Bot still logs shadow at $100 at source (follow-up: read STAKE into cfg.stake). See [[kalshi-execution-issues]] #5.
 ## Decision: edge is thin/regime-dependent & currently losing (analysis: Δ>=80 keeps a tiny +$8 recent w/ CI excl 0, but Δ>=20 loses -$43 recent; entry deviation only -$13, fee -$130 is the big cost; +$4191 paper was a hot streak Jun21-23 before live). $200 parked in subaccount #1 (idle now). Open: move $200 back 1->0? fully stop shadow service? shadow-test Δ>=80?
 ## (prior) Status: 2026-06-29 ~12:15 UTC. LIVE ISOLATED ON SUBACCOUNT #1 ($200). Pushed to main both repos (61d87ef).
 ## Live config now: SUBACCOUNT=1 (verified — order debited #1, acct 0 untouched), max_entry 0.92, loss_stop $100, P0b+http2+telemetry, PID 1548004. Subaccount #1 funded $200 (2 transfers from 0). total real PnL ~-$75 (on acct 0, pre-switch). ⚠️ loss-stop $100 on $200=50%/day — recommend tightening (user left $100). Subaccount endpoints: GET /portfolio/subaccounts/balances, POST /portfolio/subaccounts/transfer; order body field `subaccount`. Signing via python+cryptography on box (key /home/dmitrii/.kalshi_live.pem). TRIPWIRE still: WR>=74% keep / <73% stop.
