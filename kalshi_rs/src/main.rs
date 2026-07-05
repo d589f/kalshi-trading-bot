@@ -19,6 +19,9 @@ mod signal;
 mod state;
 mod window;
 
+#[cfg(test)]
+mod f1_regression;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

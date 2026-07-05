@@ -133,6 +133,9 @@ pub fn resolve_session_sel(name: &str) -> Option<SessionSel> {
     }
 }
 
+/// (Convenience form of the resolver — kept as the stable API named by the
+/// architecture review; prod wiring goes through `resolve_session_sel`.)
+#[allow(dead_code)]
 pub fn resolve_session(name: &str) -> Option<SessionConfig> {
     resolve_session_sel(name).map(|s| s.config())
 }
