@@ -53,7 +53,10 @@ fn parse_ts(v: Option<&Value>) -> Option<DateTime<Utc>> {
 /// (Rejecting here keeps engine.rs untouched, per the architecture review.)
 pub fn extract_live_sigma(sessions_state: &Value, session_key: &str) -> Option<f64> {
     let v = sessions_state.get(session_key)?.get("live_sigma")?.as_f64()?;
-    if v.is_finite() && v > 0.0 {
+    // Sanity band (security audit): real max10/max30 values live around 1e-5..1e-2.
+    // A corrupt-but-positive tiny σ would push p→1 and defeat the confidence gate
+    // entirely (snr→∞), so wildly out-of-band values fail closed too.
+    if v.is_finite() && (1e-7..=1e-1).contains(&v) {
         Some(v)
     } else {
         None
@@ -171,10 +174,16 @@ mod tests {
         assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
     }
 
-    // Tiny-but-positive sigma is valid (real max10 values are ~1e-4).
+    // Sanity band: realistic σ passes; out-of-band positive values (corrupt feed —
+    // a tiny σ would defeat the p-gate with p→1) fail closed on both edges.
     #[test]
-    fn extract_tiny_positive_ok() {
-        let s = json!({"f1_d50cap75": {"live_sigma": 1e-9}});
-        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), Some(1e-9));
+    fn extract_sanity_band() {
+        let ok = |v: f64| json!({"f1_d50cap75": {"live_sigma": v}});
+        assert_eq!(extract_live_sigma(&ok(1e-5), "f1_d50cap75"), Some(1e-5));
+        assert_eq!(extract_live_sigma(&ok(1e-7), "f1_d50cap75"), Some(1e-7)); // band edges inclusive
+        assert_eq!(extract_live_sigma(&ok(1e-1), "f1_d50cap75"), Some(1e-1));
+        assert_eq!(extract_live_sigma(&ok(1e-9), "f1_d50cap75"), None); // p→1 exploit
+        assert_eq!(extract_live_sigma(&ok(1e300), "f1_d50cap75"), None);
+        assert_eq!(extract_live_sigma(&ok(0.5), "f1_d50cap75"), None);
     }
 }

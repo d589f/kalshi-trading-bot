@@ -77,6 +77,18 @@ fn select_session(env_val: Option<&str>) -> (SessionSel, Option<String>) {
     }
 }
 
+/// Strict SUBACCOUNT parse: a present-but-garbage value REFUSES to start — the old
+/// silent 0 default would route real orders to the PRIMARY account, defeating the
+/// subaccount isolation (security audit, MEDIUM).
+fn parse_subaccount(env_val: Option<&str>) -> Result<u32, String> {
+    match env_val.map(str::trim) {
+        None | Some("") => Ok(0),
+        Some(s) => s
+            .parse::<u32>()
+            .map_err(|_| format!("SUBACCOUNT='{s}' is not a valid subaccount number")),
+    }
+}
+
 /// Insert the mirrored paper sigma under the key the gate actually reads
 /// (`cfg.sigma_type`). Hardcoding "max30" here was the H2 bug: under F1
 /// (sigma_type="max10") the gate's lookup would MISS and silently fall back to the
@@ -522,6 +534,15 @@ async fn main() -> Result<()> {
             "MIRROR mode ON — signal sourced from paper engine {u} (max_age={}s, session={})",
             mcfg.max_age_secs, mcfg.session_key
         );
+        // An unknown key isn't fatal (MIRROR_SESSION may point at any paper session),
+        // but if the paper engine doesn't expose it every tick will skip — say so loudly
+        // instead of leaving only the generic per-tick skip warning.
+        if config::resolve_session_sel(&mcfg.session_key).is_none() {
+            warn!(
+                "MIRROR_SESSION='{}' is not a known strategy key — if the paper engine does not expose this session, the bot will skip EVERY tick (no trades)",
+                mcfg.session_key
+            );
+        }
     }
     let http = reqwest::Client::new();
     let live_state = Arc::new(Mutex::new(load_live_state()));
@@ -535,8 +556,14 @@ async fn main() -> Result<()> {
         }
     }
     // Route live orders to this subaccount (0 = primary). Set SUBACCOUNT=1 to isolate the bot
-    // on a funded subaccount instead of the main balance.
-    let subaccount = env_i64("SUBACCOUNT", 0).max(0) as u32;
+    // on a funded subaccount instead of the main balance. Garbage value = refuse to start.
+    let subaccount = match parse_subaccount(std::env::var("SUBACCOUNT").ok().as_deref()) {
+        Ok(n) => n,
+        Err(e) => {
+            error!("{e} — refusing to start (a silent default would route REAL orders to the primary account)");
+            anyhow::bail!("invalid SUBACCOUNT env");
+        }
+    };
     let order_client: Option<Arc<OrderClient>> =
         match (std::env::var("KALSHI_KEY_ID"), std::env::var("KALSHI_KEY_PATH")) {
             (Ok(kid), Ok(kpath)) => match std::fs::read_to_string(&kpath) {
@@ -975,7 +1002,11 @@ async fn signal_loop(
                         warn!(
                             "[{}] MIRROR {} — skipping tick (no blind trades)",
                             session_tag,
-                            if other.is_some() { "STALE" } else { "UNREACHABLE" }
+                            if other.is_some() {
+                                "STALE"
+                            } else {
+                                "UNAVAILABLE (down, bad response, or rejected σ)"
+                            }
                         );
                     }
                     dash.lock().unwrap().live.reason = "MIRROR WAIT".to_string();
@@ -2137,7 +2168,24 @@ mod tests {
         let none_latch: Option<String> = None;
         assert!(none_latch.as_deref() != same);
     }
+    // ---- security-audit hardening (post-review) ----
+
+    // SUBACCOUNT must parse strictly: garbage refuses (silent 0 would route real
+    // orders to the PRIMARY account and defeat subaccount isolation).
+    #[test]
+    fn parse_subaccount_strict() {
+        assert_eq!(parse_subaccount(None), Ok(0));
+        assert_eq!(parse_subaccount(Some("")), Ok(0));
+        assert_eq!(parse_subaccount(Some("  ")), Ok(0));
+        assert_eq!(parse_subaccount(Some("0")), Ok(0));
+        assert_eq!(parse_subaccount(Some("1")), Ok(1));
+        assert_eq!(parse_subaccount(Some(" 1 ")), Ok(1));
+        assert!(parse_subaccount(Some("1x")).is_err());
+        assert!(parse_subaccount(Some("-1")).is_err());
+        assert!(parse_subaccount(Some("one")).is_err());
+    }
 }
+
 
 
 
