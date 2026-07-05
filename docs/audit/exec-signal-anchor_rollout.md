@@ -6,7 +6,7 @@ book GET, concurrent 500ms-bounded telemetry, requote disabled). Branch feat/exe
 ## Preconditions
 - [x] Slice-3 suite green (83 tests) + clippy new-code clean.
 - [x] §2 F1 go-live audit passed (docs/audit/live-f1-entry-fidelity.md).
-- [ ] Security/code review of the diff (quality gate before restart).
+- [x] Security/code review of the diff: PASS, 0 critical/major; 2 MINORs fixed pre-deploy (clamp panic guard on MAX_COUNT<1, stale dead_code markers) — e1cc5b9.
 
 ## Deploy (EU box 34.32.177.126, systemd kalshi-shadow-com)
 1. Backup: `cp target/release/kalshi_bot target/release/kalshi_bot.bak.<TS>` + `src.bak.<TS>`.
@@ -20,7 +20,7 @@ book GET, concurrent 500ms-bounded telemetry, requote disabled). Branch feat/exe
 5. Verify startup log: `order client ready | ... exec_anchor=Signal` and the F1 session line.
 
 ## Deploy timestamp (RECORD — the authoritative ask-vs-signal ledger segmentation boundary)
-- **EXEC_ANCHOR=signal live since (UTC): 2026-07-05T__:__:__Z** ← fill at deploy
+- **EXEC_ANCHOR=signal live since (UTC): 2026-07-05T21:00:03Z** (restart at window start; PID 1187023; startup log shows exec_anchor=Signal)
 - Secondary discriminators for mixed-mode analysis: `requote==true` ⟹ ask-mode row;
   in signal rows `first_limit_price == round(signal_entry ± 0.06, 2)` exactly.
 

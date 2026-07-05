@@ -2,7 +2,16 @@
 
 ## Branch: feat/live-f1-strategy (off feat/dashboard-f1-compare @ 38bee0c)
 
-## Feature: dashboard-f1-live-line — separate LIVE F1 chart line (real $5, anchored at pink paper-F1) + honest shadow twin (green stays shadow) + table US column -> LIVE. Branch feat/dashboard-f1-live-line (off feat/live-f1-strategy), bootstrap 26326e6, plan .claude/plan-dashboard-f1-live-line.md.
+## Feature: exec-signal-anchor — IOC limit = signal±PRICE_BUF, no pre-order book GET (concurrent telemetry, timeout 500ms), requote off in signal mode. EXEC_ANCHOR env default ask=legacy. Branch feat/exec-signal-anchor (off dashboard-f1-live-line 706ad1d), bootstrap c4c5dde, plan .claude/plan-exec-signal-anchor.md.
+## Status: COMPLETE — EXEC_ANCHOR=signal LIVE on EU since 2026-07-05T21:00:03Z (PID 1187023).
+## Slices: S1 848d6d2 (selector+helpers), S2 3375cca (place_live fork: ask arm verbatim / signal arm join!(create_ioc, timeout500ms book GET), requote off), S3 3c76186 (regression guard), review PASS 0crit/0major -> e1cc5b9 (MAX_COUNT<1 clamp panic guard + markers) + runbook w/ deploy ts. 84 tests.
+## WATCH (first ~20 fills): eff <= signal_entry+0.06 per fill; drift tail >6c gone; no-fill rate vs paper F1 coverage (pre-fix 20/21); latency_ms drop (no book RTT); deploy-ts boundary for ask/signal ledger segmentation = 2026-07-05T21:00:03Z.
+### W1 S1: config.rs ExecAnchor+resolver; main.rs select_exec_anchor + pure pricing helpers + TELEMETRY_TIMEOUT_MS [SECURITY] — pending
+### W2 S2: place_live fork (ask verbatim / signal join!) + anchor threading + tail exec_entry Option overwrite [SECURITY+ARCH] — pending
+### W3 S3: f1_regression guard (byte-identity grid, hard bound, clippy) — pending
+### W4 S4: runbook docs/audit/exec-signal-anchor_rollout.md + EU deploy (drop-in EXEC_ANCHOR=signal, restart first 60s of window, RECORD deploy ts, watch eff<=signal+0.06) — pending
+
+## (prev) Feature: dashboard-f1-live-line — separate LIVE F1 chart line (real $5, anchored at pink paper-F1) + honest shadow twin (green stays shadow) + table US column -> LIVE. Branch feat/dashboard-f1-live-line (off feat/live-f1-strategy), bootstrap 26326e6, plan .claude/plan-dashboard-f1-live-line.md.
 ## Status: COMPLETE — deployed both boxes 2026-07-05 ~14:05 UTC
 ### Wave 1
 - [x] S1: live flag + flag-scoped resolve/retain + replay — a55db5b (71 tests)
