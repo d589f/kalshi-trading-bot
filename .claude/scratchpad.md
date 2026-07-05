@@ -2,7 +2,21 @@
 
 ## Branch: feat/live-f1-strategy (off feat/dashboard-f1-compare @ 38bee0c)
 
-## Status: COMPLETE — F1 LIVE ON PROD since 2026-07-05 11:45 UTC (PID 709583). Feature done, all 9 slices (7 skipped by audit verdict).
+## Feature: dashboard-f1-live-line — separate LIVE F1 chart line (real $5, anchored at pink paper-F1) + honest shadow twin (green stays shadow) + table US column -> LIVE. Branch feat/dashboard-f1-live-line (off feat/live-f1-strategy), bootstrap 26326e6, plan .claude/plan-dashboard-f1-live-line.md.
+## Status: COMPLETE — deployed both boxes 2026-07-05 ~14:05 UTC
+### Wave 1
+- [x] S1: live flag + flag-scoped resolve/retain + replay — a55db5b (71 tests)
+### Wave 2
+- [x] S2: compare() com_*/lv_* split + lv aggregates — 1d7d6a3 (74)
+- [x] S3: twin_window latch + twin emit in live branch — 76b0b57 (72)
+### Wave 3
+- [x] S4: chart LIVE line #ff7b72 anchored at pink F1 + table US->LIVE + cards + tooltip — 1070d8c
+### Wave 4 + review
+- [x] Review found MAJOR-1: pre-feature live fills (LiveTriggerRecord live:true) had flag-less resolves -> replay couldn't match -> LIVE line would render EMPTY. Fixed: resolve() returns bool, legacy resolve tries shadow then falls back to live row — 8dd193a (75 tests). MINOR-1 acknowledged: dash.triggers uncapped, twin ~doubles growth, /shadow_com 4MB body cap hits in ~100d — FOLLOW-UP needed (retention cap).
+- [x] S5 deployed: same source both boxes (EU rebuild 9m33s after fix re-upload; Buffalo needed current Cargo.toml too — its old one lacked reqwest http2 feature, E0599). EU restarted 14:02:07 UTC inside window <180s (no F1 fire possible), Buffalo 14:05. VERIFIED live: /stats has 7 lv rows (today's F1 fills, 100% match_lv, all positive), 287 shadow rows; HTML has _S.lv/#ff7b72/LIVE column. Backups: EU src.bak+kalshi_bot.bak.20260705-161144, Buffalo .bak.20260705-161700.
+- WATCH: next F1 trigger must produce BOTH twin (green steps) + live fill (LIVE line steps); no-fill window -> green steps, LIVE flat.
+
+## (prev feature) Status: COMPLETE — F1 LIVE ON PROD since 2026-07-05 11:45 UTC (PID 709583). Feature done, all 9 slices (7 skipped by audit verdict).
 ## Slice 9 DONE: EU box rebuilt (11m26s; had to free disk — / was 100% full: truncated /tmp/paper_compare*.log ~620M w/ .tail kept, journal vacuum, old binary baks pruned; /root/paper_compare DBs+baks NOT touched, 830M free now, box will refill — flag to user). Drop-in mirror.conf: SESSION=f1_d50cap75 MIRROR_SESSION=f1_d50cap75 STAKE=5 SUBACCOUNT=1 MAX_ENTRY=0.92 DAILY_LOSS_STOP=30 MAX_TRADES_DAY=96 PRICE_BUF=0.06 LIVE_TRADING=1. Pre-flight (LIVE=0) verified: F1 params log, mirror session f1, σ(max10)=0.000270 flowing, gate correctly skipped HIGH 0.96>0.92. Live startup verified: "order client ready | LIVE_TRADING=true stake=$5 max/day=96 loss_stop=$30 subaccount=1". Backups: src.bak.20260705-125937, kalshi_bot.bak.20260705-125937, /home/dmitrii/mirror.conf.bak.20260705. Rollback: restore drop-in (or unset SESSION/MIRROR_SESSION, LIVE_TRADING=0) + .bak binary + daemon-reload + restart.
 ## Quality gates: code review PASS (0 crit/major, 6 invariants hold), security audit PASS (A+B) -> hardening 1899eaa (sigma band [1e-7,1e-1], strict SUBACCOUNT parse refuses garbage, MIRROR_SESSION warn, honest skip label). 64 tests.
 ## WATCH: first F1 live fills' telemetry (signal_entry vs paper F1 entry -> mirror gap ~0; drift/walk at 180s momentum vs f6's 270s), exec_entry clamp 0.98 watch item from audit, subaccount #1 balance ($147.73 start). Dashboard 23.95.217.78:8890: green=live F1 (shadow_com push), pink=paper F1.
