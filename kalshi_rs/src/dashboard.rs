@@ -578,50 +578,67 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 const LWC_JS: &str = include_str!("../static/lwc.js");
 
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
-<title>Kalshi f6 — feeds vs paper</title>
+<title>kalshi f1 term</title>
 <style>
- body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Menlo,monospace;margin:0;padding:18px}
- h1{font-size:16px;margin:14px 0 6px} .sub{color:#8b949e;margin-bottom:12px}
- .grid{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 13px;min-width:115px}
- .big{min-width:175px}
- .k{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.5px} .v{font-size:19px;font-weight:600;margin-top:2px} .vb{font-size:26px}
- .green{color:#3fb950}.red{color:#f85149}.blue{color:#58a6ff}.yellow{color:#d29922}.dim{color:#8b949e}
- table{border-collapse:collapse;width:100%;font-size:12px;margin-bottom:18px} th,td{text-align:right;padding:4px 7px;border-bottom:1px solid #21262d}
- th{color:#8b949e;font-weight:500} td.l,th.l{text-align:left} .sep{border-left:2px solid #30363d}
- .reason{font-size:15px;font-weight:600} button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 12px;cursor:pointer}
- .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:6px;animation:p 1.5s infinite}@keyframes p{50%{opacity:.3}}
- .tip{position:absolute;z-index:60;display:none;background:#161b22;border:1px solid #444c56;border-radius:9px;padding:11px 13px;font-size:12px;line-height:1.55;box-shadow:0 8px 28px rgba(0,0,0,.65);pointer-events:none;max-width:340px;min-width:230px}
- .tip h4{margin:0 0 7px;font-size:12.5px;color:#c9d1d9;border-bottom:1px solid #30363d;padding-bottom:5px}
- .tip h4 .mk{font-weight:400;color:#8b949e;font-size:11px}
- .tip .seg{margin:6px 0 2px;font-weight:600}
- .tip .row{display:flex;justify-content:space-between;gap:18px;padding:0px 0}
- .tip .lbl{color:#8b949e}
- .tip .none{color:#6e7681;font-style:italic}
+ body{background:#000;color:#b8c0a8;font:13px/1.35 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:8px 10px}
+ ::selection{background:#0f0;color:#000}
+ .bar{color:#33ff66;white-space:pre-wrap;border-bottom:1px dashed #2f3b2f;padding-bottom:4px;margin-bottom:9px}
+ .bar .host{background:#33ff66;color:#000;padding:0 6px;font-weight:700}
+ .cur{display:inline-block;width:8px;background:#33ff66;animation:bl 1.1s steps(1) infinite}
+ @keyframes bl{50%{opacity:0}}
+ .panes{display:flex;gap:9px;flex-wrap:wrap;align-items:stretch;margin-bottom:9px}
+ .pane{border:1px solid #2f3b2f;padding:6px 9px 7px;min-width:230px;flex:1;background:#000}
+ .pane.wide{flex:1.6;min-width:300px}
+ .ptitle{color:#6a8f5f;margin:-14px 0 6px 2px;background:#000;display:inline-block;padding:0 6px}
+ .kv{display:flex;justify-content:space-between;gap:14px}
+ .kv .k{color:#5f6b5f}
+ .kv .v{font-weight:600;text-align:right;white-space:nowrap}
+ .kv.big .v{font-size:16px}
+ .green{color:#33ff66}.red{color:#ff5544}.blue{color:#58a6ff}.yellow{color:#e6c65c}.dim{color:#5f6b5f}
+ table{border-collapse:collapse;width:100%;font-size:12px;margin:2px 0 4px}
+ th,td{text-align:right;padding:1px 6px;border-bottom:1px dotted #16201a}
+ th{color:#6a8f5f;font-weight:400;border-bottom:1px solid #2f3b2f}
+ td.l,th.l{text-align:left} .sep{border-left:1px dashed #2f3b2f}
+ .reason{font-weight:700}
+ button{background:#000;color:#33ff66;border:1px solid #2f3b2f;padding:1px 10px;cursor:pointer;font:inherit}
+ .hint{color:#4a544a;margin:3px 0 2px}
+ .tip{position:absolute;z-index:60;display:none;background:#000;border:1px double #4a5f4a;padding:8px 10px;font-size:12px;line-height:1.4;pointer-events:none;max-width:340px;min-width:230px}
+ .tip h4{margin:0 0 5px;font-size:12px;color:#b8c0a8;border-bottom:1px dashed #2f3b2f;padding-bottom:3px;font-weight:600}
+ .tip h4 .mk{font-weight:400;color:#5f6b5f;font-size:11px}
+ .tip .seg{margin:5px 0 1px;font-weight:600}
+ .tip .row{display:flex;justify-content:space-between;gap:16px}
+ .tip .lbl{color:#5f6b5f}
+ .tip .none{color:#4a544a;font-style:italic}
 </style></head><body>
-<h1><span class=dot></span>Kalshi f6_wait270 — LIVE $5 (real orders) vs paper</h1>
-<div class=sub id=sub>connecting…</div>
-<div class=grid id=realpnl></div>
-<div class=grid id=match></div>
-<div class=grid id=live></div>
-<h1>Cumulative PnL <span class=dim>(fees + slippage included)</span>: <span class=yellow>paper f6 $5-twin</span> · <span style="color:#f778ba">paper F1 $5-twin</span> · <span class=green>SHADOW twin @ $5</span> · <span style="color:#ff7b72">LIVE F1 (real $5, старт от точки F1)</span> <span id=chartlbl class=dim></span></h1>
+<div class=bar><span class=host> kalshi-f1@prod </span> LIVE $5 real · subacct#1 · mirror f1_d50cap75 · loss-stop $30<span class=cur>&nbsp;</span>
+<span id=sub class=dim>connecting…</span></div>
+<div class=panes>
+ <div class=pane><div class=ptitle>┌─[ money ]────────</div><div id=realpnl></div></div>
+ <div class=pane><div class=ptitle>┌─[ sync ]────</div><div id=match></div></div>
+ <div class=pane><div class=ptitle>┌─[ signal ]──────────</div><div id=live></div></div>
+</div>
+<div class=pane style="margin-bottom:9px">
+<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#f778ba">paper F1</span> · <span class=green>SHADOW twin</span> · <span style="color:#ff7b72">LIVE real (старт от точки F1)</span> ]───</div>
 <div id=chartwrap style="position:relative">
-<div id=chart style="width:100%;height:340px;border:1px solid #30363d;border-radius:8px;overflow:hidden"></div>
+<div id=chart style="width:100%;height:340px"></div>
 <div id=tip class=tip></div>
 </div>
-<div class=sub style="margin-top:4px">наведи на точку графика и задержи курсор ~1с → детали сделки этого окна</div>
-<div style="margin:8px 0"><button onclick=load()>↻ refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
-<h1>Per-window: <span class=yellow>PAPER f6</span> vs <span style="color:#ff7b72">LIVE F1 (наши реальные входы)</span> vs <span class=green>SHADOW twin</span></h1>
+<div class=hint><span id=chartlbl></span></div>
+<div class=hint>hover ~1s → детали окна · <button onclick=load()>refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
+</div>
+<div class=pane>
+<div class=ptitle>┌─[ windows: <span class=yellow>paper f6</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=f1</th>
  <th class=sep>SHADOW</th><th>entry</th><th>Δ</th><th>=pa</th></tr></thead><tbody id=cmp></tbody></table>
+</div>
 <script src="/lwc.js"></script>
 <script>
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
 const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
 const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
-function card(k,v,cls,big){return `<div class="card ${big?'big':''}"><div class=k>${k}</div><div class="v ${big?'vb':''} ${cls||''}">${v}</div></div>`}
+function card(k,v,cls,big){return `<div class="kv ${big?'big':''}"><span class=k>${k}</span><span class="v ${cls||''}">${v}</span></div>`}
 const rc=v=>v==null?'':(v>0?'green':v<0?'red':'');
 const mk=(b)=>b===true?'<span class=green>✓</span>':b===false?'<span class=red>✗</span>':'<span class=dim>·</span>';
 // $5 Kalshi-economics TWIN of a paper trade: run the paper signal through the SAME economics
@@ -634,10 +651,10 @@ let _chart=null, _S={}, _cmp=[], _tipTimer=null;
 function initChart(){
  const el=document.getElementById('chart');
  _chart=LightweightCharts.createChart(el,{
-   layout:{background:{type:'solid',color:'#0d1117'},textColor:'#c9d1d9',fontFamily:'ui-monospace,Menlo,monospace',fontSize:12},
-   grid:{vertLines:{color:'#1c2128'},horzLines:{color:'#1c2128'}},
-   rightPriceScale:{borderColor:'#30363d'},
-   timeScale:{borderColor:'#30363d',timeVisible:true,secondsVisible:false},
+   layout:{background:{type:'solid',color:'#000000'},textColor:'#6a8f5f',fontFamily:'ui-monospace,Menlo,monospace',fontSize:12},
+   grid:{vertLines:{color:'#101510'},horzLines:{color:'#101510'}},
+   rightPriceScale:{borderColor:'#2f3b2f'},
+   timeScale:{borderColor:'#2f3b2f',timeVisible:true,secondsVisible:false},
    crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#8b949e',labelBackgroundColor:'#30363d'},horzLine:{color:'#8b949e',labelBackgroundColor:'#30363d'}},
  });
  const mk=(c,t)=>_chart.addLineSeries({color:c,lineWidth:2,title:t,priceLineVisible:false,lastValueVisible:true,
