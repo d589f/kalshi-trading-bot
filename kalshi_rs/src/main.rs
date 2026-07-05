@@ -409,6 +409,18 @@ struct LiveState {
     /// authoritative all-time real PnL across every resolved live trade (fees included)
     #[serde(default)]
     total_pnl: f64,
+    /// window_start (rfc3339) of the last CONFIRMED live fill — persists the
+    /// 1-trade-per-window latch across restarts, so a redeploy right after a fill
+    /// cannot double-order the same still-open window. Old state files parse to None.
+    #[serde(default)]
+    last_filled_window: Option<String>,
+}
+
+/// Mark a confirmed fill in the persistent live state: bump the day counter and
+/// remember the filled window for the restart latch.
+fn record_fill_state(s: &mut LiveState, win_key: Option<String>) {
+    s.trades_today += 1;
+    s.last_filled_window = win_key;
 }
 
 /// Sum the real PnL of every `resolve` row in a ledger string. Telemetry rows
@@ -866,7 +878,10 @@ async fn signal_loop(
 ) {
     let session_tag = sel.session_tag();
     let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
-    let mut fired_window: Option<String> = None;
+    // Restart latch: seed from the persisted last CONFIRMED fill. If that window is
+    // still the current one (redeploy mid-window), the per-tick `fired_window ==
+    // win_key` check skips it — no double order. A past window simply never matches.
+    let mut fired_window: Option<String> = live_state.lock().unwrap().last_filled_window.clone();
     let mut last_status_log = 0.0f64;
     // P0b per-window retry state (reset when the window rolls).
     let mut attempt_window: Option<String> = None;
@@ -1276,7 +1291,14 @@ async fn place_live(
         let mut s = live_state.lock().unwrap();
         let today = now_utc.format("%Y-%m-%d").to_string();
         if s.day != today {
-            *s = LiveState { day: today, trades_today: 0, day_pnl: 0.0, total_pnl: s.total_pnl };
+            *s = LiveState {
+                day: today,
+                trades_today: 0,
+                day_pnl: 0.0,
+                total_pnl: s.total_pnl,
+                // keep the latch: a day roll doesn't un-fill the window it points at
+                last_filled_window: s.last_filled_window.clone(),
+            };
             save_live_state(&s);
         }
         (
@@ -1408,7 +1430,7 @@ async fn place_live(
     let fee = resp.fee();
     {
         let mut s = live_state.lock().unwrap();
-        s.trades_today += 1;
+        record_fill_state(&mut s, win.window_start.map(|w| w.to_rfc3339()));
         save_live_state(&s);
     }
     let w_start = win.window_start.map(|w| w.to_rfc3339()).unwrap_or_default();
@@ -2070,6 +2092,49 @@ mod tests {
         let coid = format!("{}{}-{}", SessionSel::F6.coid_prefix(), 123i64, "yes");
         assert!(coid.starts_with("f6-"));
     }
+    // ---- slice 6: restart double-order latch (live-f1-strategy) ----
+
+    // TC-19.1: legacy live_state.json without the new field parses cleanly to None —
+    // the prod state file must survive the upgrade.
+    #[test]
+    fn live_state_serde_back_compat() {
+        let legacy = r#"{"day":"2026-06-30","trades_today":59,"day_pnl":-34.47,"total_pnl":-131.3}"#;
+        let s: LiveState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.last_filled_window, None);
+        assert_eq!(s.trades_today, 59);
+        // and roundtrips with the field set
+        let mut s2 = s.clone();
+        s2.last_filled_window = Some("2026-07-05T12:00:00+00:00".to_string());
+        let j = serde_json::to_string(&s2).unwrap();
+        let back: LiveState = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.last_filled_window.as_deref(), Some("2026-07-05T12:00:00+00:00"));
+    }
+
+    // TC-19.2: a confirmed fill records the filled window (and bumps the day counter).
+    #[test]
+    fn record_fill_state_sets_latch() {
+        let mut s = LiveState::default();
+        record_fill_state(&mut s, Some("W1".to_string()));
+        assert_eq!(s.trades_today, 1);
+        assert_eq!(s.last_filled_window.as_deref(), Some("W1"));
+    }
+
+    // TC-19.3/19.4/19.6: the seeded latch skips ONLY the same still-open window; any
+    // other (past/future) window never matches, so trading resumes normally.
+    #[test]
+    fn seeded_latch_blocks_only_same_window() {
+        let fired_window: Option<String> = Some("2026-07-05T12:00:00+00:00".to_string());
+        let same = Some("2026-07-05T12:00:00+00:00");
+        let next = Some("2026-07-05T12:15:00+00:00");
+        let much_later = Some("2026-07-05T13:00:00+00:00");
+        assert!(fired_window.as_deref() == same); // already fired -> skip
+        assert!(fired_window.as_deref() != next); // latch clear
+        assert!(fired_window.as_deref() != much_later);
+        // no persisted fill (legacy state) -> nothing blocked
+        let none_latch: Option<String> = None;
+        assert!(none_latch.as_deref() != same);
+    }
 }
+
 
 
