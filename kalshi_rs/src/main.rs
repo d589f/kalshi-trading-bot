@@ -356,6 +356,8 @@ fn replay_line_into(d: &mut Dash, line: &str) {
                     result: None,
                     won: None,
                     pnl: None,
+                    // LiveTriggerRecord rows carry "live":true; legacy shadow rows omit it
+                    live: v["live"].as_bool().unwrap_or(false),
                 });
             }
         }
@@ -366,6 +368,7 @@ fn replay_line_into(d: &mut Dash, line: &str) {
             v["result"].as_str().unwrap_or(""),
             v["won"].as_bool().unwrap_or(false),
             v["pnl_usd"].as_f64().unwrap_or(0.0),
+            v["live"].as_bool().unwrap_or(false),
         ),
         _ => {}
     }
@@ -814,6 +817,13 @@ async fn kalshi_poller(state: Arc<Mutex<AppState>>, rest: Arc<KalshiRest>) {
     }
 }
 
+/// Keep-predicate for the pending list after `pd` resolves: remove only rows matching
+/// ticker/side/entry AND the live flag — a twin resolve must never evict the live
+/// pending (they can share ticker/side/entry when eff == signal_entry).
+fn retain_after_resolve(x: &Pending, pd: &Pending) -> bool {
+    !(x.ticker == pd.ticker && x.side == pd.side && x.entry == pd.entry && x.live == pd.live)
+}
+
 /// Score fired would-be orders on Kalshi's real settlement.
 async fn resolver(
     rest: Arc<KalshiRest>,
@@ -855,6 +865,7 @@ async fn resolver(
                             result: &m.result,
                             won,
                             pnl_usd: (pnl * 100.0).round() / 100.0,
+                            live: pd.live,
                         });
                         if pd.live {
                             let mut s = live_state.lock().unwrap();
@@ -878,10 +889,9 @@ async fn resolver(
                             &m.result,
                             won,
                             (pnl * 100.0).round() / 100.0,
+                            pd.live,
                         );
-                        pending.lock().unwrap().retain(|x| {
-                            !(x.ticker == pd.ticker && x.side == pd.side && x.entry == pd.entry)
-                        });
+                        pending.lock().unwrap().retain(|x| retain_after_resolve(x, &pd));
                     }
                 }
                 Err(e) => warn!("resolve get_market {}: {e}", pd.ticker),
@@ -1271,6 +1281,7 @@ fn emit_trigger(
         result: None,
         won: None,
         pnl: None,
+        live: false, // strategy would-be (shadow twin)
     });
 }
 
@@ -1512,6 +1523,7 @@ async fn place_live(
         result: None,
         won: None,
         pnl: None,
+        live: true, // REAL fill — raw $5 money
     });
     if let Some(we) = win.window_end {
         pending.lock().unwrap().push(Pending {
@@ -2184,7 +2196,73 @@ mod tests {
         assert!(parse_subaccount(Some("-1")).is_err());
         assert!(parse_subaccount(Some("one")).is_err());
     }
+    // ---- slice 1 (dashboard-f1-live-line): replay live flags + retain hardening ----
+
+    // TC-10.x: mixed pre/post-feature JSONL replays with correct flags and each
+    // resolve attaching to its OWN row even at eff == signal_entry, both orders.
+    #[test]
+    fn replay_mixed_ledger_split_and_dual_resolve() {
+        let twin = r#"{"kind":"trigger","ts_iso":"t1","window_start":"W1","window_end":"W2","market_ticker":"T","side":"yes","entry":0.85,"count":112,"delta_from_open":60.0,"p":0.7}"#;
+        let livefill = r#"{"kind":"trigger","outcome":"filled","live":true,"ts_iso":"t2","window_start":"W1","window_end":"W2","market_ticker":"T","side":"yes","entry":0.85,"count":6,"delta_from_open":60.0,"p":0.7}"#;
+        let res_live = r#"{"kind":"resolve","market_ticker":"T","side":"yes","entry":0.85,"result":"yes","won":true,"pnl_usd":0.83,"live":true}"#;
+        let res_twin = r#"{"kind":"resolve","market_ticker":"T","side":"yes","entry":0.85,"result":"yes","won":true,"pnl_usd":13.0,"live":false}"#;
+        for order in [[res_live, res_twin], [res_twin, res_live]] {
+            let mut d = Dash::default();
+            replay_line_into(&mut d, twin);
+            replay_line_into(&mut d, livefill);
+            for r in order {
+                replay_line_into(&mut d, r);
+            }
+            assert_eq!(d.triggers.len(), 2);
+            let tw = d.triggers.iter().find(|t| !t.live).unwrap();
+            let lv = d.triggers.iter().find(|t| t.live).unwrap();
+            assert_eq!(tw.pnl, Some(13.0));
+            assert_eq!(lv.pnl, Some(0.83));
+        }
+    }
+
+    // Legacy resolve rows (no live key) attach to live=false rows — pre-feature
+    // ledgers are all-shadow, so absent -> false is the correct meaning.
+    #[test]
+    fn replay_legacy_resolve_goes_to_shadow_row() {
+        let mut d = Dash::default();
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"trigger","ts_iso":"t","window_start":"W1","market_ticker":"T","side":"no","entry":0.7,"count":7,"delta_from_open":-60.0}"#,
+        );
+        replay_line_into(
+            &mut d,
+            r#"{"kind":"resolve","market_ticker":"T","side":"no","entry":0.7,"result":"no","won":true,"pnl_usd":2.1}"#,
+        );
+        assert!(!d.triggers[0].live);
+        assert_eq!(d.triggers[0].pnl, Some(2.1));
+    }
+
+    // TC-13.3: flag-scoped retain — a twin resolve must never evict the live pending.
+    #[test]
+    fn retain_after_resolve_is_flag_scoped() {
+        let mk = |live: bool| Pending {
+            ticker: "T".to_string(),
+            side: "yes",
+            entry: 0.85,
+            count: if live { 6.0 } else { 112.0 },
+            stake: if live { 5.0 } else { 100.0 },
+            window_end: Utc::now(),
+            live,
+        };
+        let twin = mk(false);
+        let live = mk(true);
+        let mut v = vec![twin.clone(), live.clone()];
+        v.retain(|x| retain_after_resolve(x, &twin));
+        assert_eq!(v.len(), 1);
+        assert!(v[0].live, "twin resolve evicted the LIVE pending");
+        let mut v = vec![mk(false), mk(true)];
+        v.retain(|x| retain_after_resolve(x, &live));
+        assert_eq!(v.len(), 1);
+        assert!(!v[0].live, "live resolve evicted the twin pending");
+    }
 }
+
 
 
 

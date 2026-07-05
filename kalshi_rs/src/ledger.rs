@@ -95,6 +95,10 @@ pub struct ResolveRecord<'a> {
     pub result: &'a str, // "yes" | "no"
     pub won: bool,
     pub pnl_usd: f64,
+    /// true = settlement of a REAL live fill; false = the shadow twin's would-be.
+    /// Replay reads it (absent → false) to attach each resolve to the right row
+    /// even when the live eff equals the twin's signal entry.
+    pub live: bool,
 }
 
 /// What actually happened when `place_live` tried to send a live order. Serialized

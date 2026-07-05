@@ -71,6 +71,11 @@ pub struct TrigSummary {
     pub won: Option<bool>,
     #[serde(default)]
     pub pnl: Option<f64>,
+    /// true = a REAL live fill (raw $5 money); false = the strategy's shadow would-be
+    /// (the "honest twin"). Old producers omit the key → false (all-shadow), which is
+    /// exactly the pre-feature meaning of the feed.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// A paper f6 trade pushed from prod (`paper_compare_kalshi_15m`, session f6_wait270).
@@ -118,10 +123,27 @@ fn wkey(s: &str) -> String {
 }
 
 impl Dash {
-    /// Update the matching live trigger with its settlement.
-    pub fn resolve(&mut self, ticker: &str, side: &str, entry: f64, result: &str, won: bool, pnl: f64) {
+    /// Update the matching trigger with its settlement. `live` is part of the match:
+    /// a live fill and its shadow twin can share (ticker, side, entry) when
+    /// eff == signal_entry — without the flag the wrong row could take the result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve(
+        &mut self,
+        ticker: &str,
+        side: &str,
+        entry: f64,
+        result: &str,
+        won: bool,
+        pnl: f64,
+        live: bool,
+    ) {
         for t in self.triggers.iter_mut() {
-            if t.ticker == ticker && t.side == side && (t.entry - entry).abs() < 1e-9 && t.result.is_none() {
+            if t.ticker == ticker
+                && t.side == side
+                && (t.entry - entry).abs() < 1e-9
+                && t.live == live
+                && t.result.is_none()
+            {
                 t.result = Some(result.to_string());
                 t.won = Some(won);
                 t.pnl = Some(pnl);
@@ -704,3 +726,76 @@ async function load(){
 }
 load();setInterval(()=>{if(document.getElementById('auto').checked)load()},2000);
 </script></body></html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AC-1 (merge blocker): old producers omit `live` — absent key MUST read false
+    // (all-shadow = exact pre-feature meaning). Wrong-TYPE live must fail the parse
+    // (strict): silently mis-splitting real-money rows from shadow rows is worse
+    // than rejecting the payload (handler keeps the last good feed on 400).
+    #[test]
+    fn trig_summary_live_serde() {
+        let t: TrigSummary = serde_json::from_str("{}").unwrap();
+        assert!(!t.live);
+        let v: Vec<TrigSummary> = serde_json::from_str(
+            r#"[{"ticker":"T","side":"yes","entry":0.85,"count":6,"live":true}]"#,
+        )
+        .unwrap();
+        assert!(v[0].live);
+        assert!(serde_json::from_str::<Vec<TrigSummary>>(r#"[{"live":"true"}]"#).is_err());
+        assert!(serde_json::from_str::<Vec<TrigSummary>>(r#"[{"live":1}]"#).is_err());
+    }
+
+    fn row(live: bool) -> TrigSummary {
+        TrigSummary {
+            ticker: "T".into(),
+            side: "yes".into(),
+            entry: 0.85, // twin signal entry == live eff (the ambiguous case)
+            live,
+            ..Default::default()
+        }
+    }
+
+    // AC-2 (merge blocker): equal-entry twin+live rows — each resolve updates ONLY
+    // the row with its own flag, in EITHER settle order.
+    #[test]
+    fn resolve_disambiguates_by_live_flag_order_independent() {
+        for twin_first in [true, false] {
+            let mut d = Dash {
+                triggers: vec![row(false), row(true)],
+                ..Default::default()
+            };
+            let calls: Vec<(bool, f64)> = if twin_first {
+                vec![(false, 13.0), (true, 0.83)]
+            } else {
+                vec![(true, 0.83), (false, 13.0)]
+            };
+            for (live, pnl) in calls {
+                d.resolve("T", "yes", 0.85, "yes", true, pnl, live);
+            }
+            let twin = d.triggers.iter().find(|t| !t.live).unwrap();
+            let lv = d.triggers.iter().find(|t| t.live).unwrap();
+            assert_eq!(twin.pnl, Some(13.0), "twin_first={twin_first}");
+            assert_eq!(lv.pnl, Some(0.83), "twin_first={twin_first}");
+        }
+    }
+
+    // A twin resolve with no matching twin row is a NO-OP (must not touch the live row).
+    #[test]
+    fn resolve_no_matching_flag_is_noop() {
+        let mut d = Dash { triggers: vec![row(true)], ..Default::default() };
+        d.resolve("T", "yes", 0.85, "yes", true, 13.0, false);
+        assert_eq!(d.triggers[0].pnl, None);
+    }
+
+    // Two rows with the SAME flag: first unresolved match takes the result (break).
+    #[test]
+    fn resolve_same_flag_first_match_breaks() {
+        let mut d = Dash { triggers: vec![row(false), row(false)], ..Default::default() };
+        d.resolve("T", "yes", 0.85, "yes", true, 13.0, false);
+        assert_eq!(d.triggers[0].pnl, Some(13.0));
+        assert_eq!(d.triggers[1].pnl, None);
+    }
+}
