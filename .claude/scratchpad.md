@@ -2,25 +2,27 @@
 
 ## Branch: feat/live-f1-strategy (off feat/dashboard-f1-compare @ 38bee0c)
 
-## Status: implementing wave 1 slice 1/9
+## Status: COMPLETE — F1 LIVE ON PROD since 2026-07-05 11:45 UTC (PID 709583). Feature done, all 9 slices (7 skipped by audit verdict).
+## Slice 9 DONE: EU box rebuilt (11m26s; had to free disk — / was 100% full: truncated /tmp/paper_compare*.log ~620M w/ .tail kept, journal vacuum, old binary baks pruned; /root/paper_compare DBs+baks NOT touched, 830M free now, box will refill — flag to user). Drop-in mirror.conf: SESSION=f1_d50cap75 MIRROR_SESSION=f1_d50cap75 STAKE=5 SUBACCOUNT=1 MAX_ENTRY=0.92 DAILY_LOSS_STOP=30 MAX_TRADES_DAY=96 PRICE_BUF=0.06 LIVE_TRADING=1. Pre-flight (LIVE=0) verified: F1 params log, mirror session f1, σ(max10)=0.000270 flowing, gate correctly skipped HIGH 0.96>0.92. Live startup verified: "order client ready | LIVE_TRADING=true stake=$5 max/day=96 loss_stop=$30 subaccount=1". Backups: src.bak.20260705-125937, kalshi_bot.bak.20260705-125937, /home/dmitrii/mirror.conf.bak.20260705. Rollback: restore drop-in (or unset SESSION/MIRROR_SESSION, LIVE_TRADING=0) + .bak binary + daemon-reload + restart.
+## Quality gates: code review PASS (0 crit/major, 6 invariants hold), security audit PASS (A+B) -> hardening 1899eaa (sigma band [1e-7,1e-1], strict SUBACCOUNT parse refuses garbage, MIRROR_SESSION warn, honest skip label). 64 tests.
+## WATCH: first F1 live fills' telemetry (signal_entry vs paper F1 entry -> mirror gap ~0; drift/walk at 180s momentum vs f6's 270s), exec_entry clamp 0.98 watch item from audit, subaccount #1 balance ($147.73 start). Dashboard 23.95.217.78:8890: green=live F1 (shadow_com push), pink=paper F1.
+## NOT pushed to remotes (user didn't ask).
 
 ## Plan (full: .claude/plan-live-f1-strategy.md; PRD §2, use-cases 22UC/96sc, QA all mapped, arch PASS-conditional w/ 8 binding constraints)
-### Wave 1
-- [ ] Slice 1: config.rs resolver+F1 factory+SessionSel (tag/coid/mirror-key) — pending
-- [ ] Slice 2: mirror.rs session param + fail-closed extract_live_sigma (>0.0) — pending [SECURITY pre-review]
-- [ ] Slice 3: docs/audit/live-f1-entry-fidelity.md 7 verdicts (threshold_gap = go-live blocker) — pending
-### Wave 2
-- [ ] Slice 4: main.rs wiring: select_session fail-loud, insert_mirror_sigma under cfg.sigma_type (H2 CRITICAL @868), display re-key 952/992, mirror_key plumbing — pending
-### Wave 3
-- [ ] Slice 5: main.rs attribution threading + coid prefix (@1258 "f6-") — pending
-### Wave 4
-- [ ] Slice 6: main.rs restart latch: LiveState.last_filled_window + boot seed — pending
-### Wave 5
-- [ ] Slice 7 (CONDITIONAL on audit): engine.rs threshold_gap replication — pending
+### Wave 1 [bootstrap e99674d] — COMPLETE
+- [x] Slice 1: config.rs resolver+F1 factory+SessionSel — fd3e4e4 (39 tests)
+- [x] Slice 2: mirror.rs session param + fail-closed extract_live_sigma (>0, finite) — a5d14f6 (45 tests)
+- [x] Slice 3: docs/audit/live-f1-entry-fidelity.md — 7e09a57 (agent). VERDICTS: p-model MATCH, entry_wait MATCH, threshold_gap MATCH/INERT (noob_fader-only -> SLICE 7 SKIPPED), max_entry MATCH, liq MATCH, sigma GAP-FIXED (slices 2+4), buffers GAP-ACCEPTED (drag=drift not buffer, 0/184 requotes; keep 0.06/0.12). Watch item: exec_entry clamp 0.98 > signal cap 0.92 (pre-existing; monitor telemetry).
+### Wave 2 — COMPLETE
+- [x] Slice 4: main.rs wiring (select_session fail-loud, insert_mirror_sigma H2 fix, display re-key, MirrorCfg.session_key) — 53c6868 (50 tests, TC-4.2 invariance proven)
+### Wave 3 — COMPLETE
+- [x] Slice 5: attribution threading (SESSION_NAME const removed, resolver/signal_loop/emit_trigger/place_live/builders take session; coid "{prefix}{ts}-{side}") — 0e35679 (51 tests)
+### Wave 4 — COMPLETE
+- [x] Slice 6: restart latch LiveState.last_filled_window + record_fill_state + boot seed — 83e9b42 (54 tests)
+### Wave 5 (renumbered; slice 7 skipped)
+- [x] Slice 8: src/f1_regression.rs (#[cfg(test)] mod — binary crate, tests/ can't import) — bec83d3 (63 tests; new-code clippy clean)
 ### Wave 6
-- [ ] Slice 8: tests/f1_regression.rs + full cargo test + clippy -D warnings — pending
-### Wave 7
-- [ ] Slice 9 (OPS): deploy EU box — shadow pre-flight (LIVE_TRADING=0, mirror-gap≈0) THEN flip 1. Env: SESSION+MIRROR_SESSION=f1_d50cap75, STAKE=5, SUBACCOUNT=1, MAX_ENTRY=0.92, DAILY_LOSS_STOP=30 — pending [SECURITY]
+- [ ] Slice 9 (OPS): deploy EU box — quality gates first (code-reviewer + security-auditor agents RUNNING on e99674d..HEAD). Then: upload src, backup *.bak.TS, on-box build, drop-in env SESSION=f1_d50cap75 MIRROR_SESSION=f1_d50cap75 STAKE=5 SUBACCOUNT=1 MAX_ENTRY=0.92 DAILY_LOSS_STOP=30; brief shadow pre-flight (LIVE_TRADING=0, verify startup log F1 params + subaccount=1), then flip LIVE_TRADING=1 (user said "давай сразу live"); watch first F1 fills' telemetry (mirror gap ~0). Rollback: unset SESSION/MIRROR_SESSION + restore .bak + restart.
 
 ## Key facts for this feature (verified 2026-07-05)
 - F1 params (from live_data.db paper_config, NOT in repo): kappa 0.4, delta_threshold 50, p>=0.65, sigma_type max10, entry_wait 3.0min (180s), max_entry 0.92 (name "cap75" LIES — legacy), BOTH sides, liq off, taker, threshold_gap 0.1.
