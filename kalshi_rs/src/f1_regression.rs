@@ -9,7 +9,11 @@ use crate::config::{
     resolve_mirror_session_key, SessionConfig, SessionSel,
 };
 use crate::engine::{evaluate, Shared, Side};
-use crate::{display_sigma, insert_mirror_sigma, select_session};
+use crate::{
+    display_sigma, exec_count, exec_no_limit, exec_yes_limit, insert_mirror_sigma,
+    select_exec_anchor, select_session, signal_count, signal_no_limit, signal_yes_limit,
+};
+use crate::config::ExecAnchor;
 
 /// Shared with BOTH sigma keys present (as the mirror would populate for the selected
 /// strategy) so one fixture can drive f6 and F1 side by side.
@@ -136,4 +140,58 @@ fn f6_default_byte_identity() {
     assert_eq!(sel.session_tag(), "f6_wait270_shadow");
     assert_eq!(sel.coid_prefix(), "f6-");
     assert_eq!(display_sigma(&m, &cfg), 0.0005);
+}
+
+// ---- exec-signal-anchor slice 3: byte-identity + invariant guard ----
+
+// AC-1: the exec_* twins ARE the legacy ask-arm formulas over a representative grid —
+// with EXEC_ANCHOR unset the priced limit/count are byte-identical to pre-feature.
+#[test]
+fn ask_mode_byte_identity_grid() {
+    for e in [0.51, 0.55, 0.66, 0.74, 0.85, 0.92, 0.98] {
+        for b in [0.0, 0.02, 0.06, 0.12] {
+            assert_eq!(exec_yes_limit(e, b), (e + b).min(0.99), "yes e={e} b={b}");
+            assert_eq!(exec_no_limit(e, b), ((1.0 - e) - b).max(0.01), "no e={e} b={b}");
+        }
+        for stake in [5.0, 100.0] {
+            assert_eq!(
+                exec_count(stake, e, 15),
+                (stake / e).round().clamp(1.0, 15.0),
+                "count stake={stake} e={e}"
+            );
+        }
+    }
+    // default selection is Ask, silently
+    assert_eq!(select_exec_anchor(None), (ExecAnchor::Ask, None));
+}
+
+// TC-10.2 hard bound + TC-12.1 sizing divergence pins.
+#[test]
+fn signal_mode_invariants() {
+    for e in [0.51, 0.66, 0.85, 0.92] {
+        for b in [0.0, 0.02, 0.06] {
+            let lim = signal_yes_limit(e, b);
+            assert!(lim <= e + b + 1e-12 && lim <= 0.99, "hard bound e={e} b={b}");
+            assert!(signal_no_limit(e, b) >= 0.01);
+        }
+        // signal price <= drifted exec price -> signal sizes at least as many contracts
+        for drift in [0.0, 0.02, 0.06] {
+            let ee = (e + drift).min(0.98);
+            assert!(
+                signal_count(5.0, e, 15) >= exec_count(5.0, ee, 15),
+                "sizing e={e} drift={drift}"
+            );
+        }
+    }
+}
+
+// Untouched-path pin: strategy selection and the f6 shadow sizing basis are independent
+// of the exec anchor (anchor code never references cfg.stake / fire sizing of the twin).
+#[test]
+fn anchor_orthogonal_to_session_selection() {
+    assert_eq!(select_session(None).0, SessionSel::F6);
+    assert_eq!(select_exec_anchor(Some("signal")).0, ExecAnchor::Signal);
+    // twin sizing basis (cfg.stake=100 over entry) unchanged by anchor helpers
+    let cfg = SessionConfig::f6_wait270();
+    assert_eq!((cfg.stake / 0.8f64).round(), 125.0);
 }
