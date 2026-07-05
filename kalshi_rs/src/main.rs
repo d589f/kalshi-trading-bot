@@ -30,7 +30,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use config::{resolve_mirror_session_key, SessionConfig, SessionSel, STATE_TICK_SECS};
+use config::{resolve_mirror_session_key, ExecAnchor, SessionConfig, SessionSel, STATE_TICK_SECS};
 use dashboard::{Dash, TrigSummary};
 use engine::{evaluate, Shared, Side};
 use kalshi::auth::Signer;
@@ -75,6 +75,69 @@ fn select_session(env_val: Option<&str>) -> (SessionSel, Option<String>) {
             )),
         ),
     }
+}
+
+/// Resolve EXEC_ANCHOR (how the live IOC limit is priced). Unset/empty → Ask (today's
+/// default). Non-empty UNKNOWN → Ask + a warning for main() to log FAIL-LOUD — a typo
+/// must NEVER flip real-money execution to Signal. Pure, testable.
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+fn select_exec_anchor(env_val: Option<&str>) -> (ExecAnchor, Option<String>) {
+    let raw = env_val.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return (ExecAnchor::Ask, None);
+    }
+    match config::resolve_exec_anchor(raw) {
+        Some(a) => (a, None),
+        None => (
+            ExecAnchor::Ask,
+            Some(format!(
+                "EXEC_ANCHOR='{raw}' is not a known anchor (accepted: ask, signal) — falling back to ask"
+            )),
+        ),
+    }
+}
+
+/// Telemetry-fetch bound in signal mode: the concurrent orderbook GET inside the order
+/// join! is cut off here so a slow book (client timeout 8s) can never stall place_live's
+/// return — the order is already gone; only exec_entry degrades to None.
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+const TELEMETRY_TIMEOUT_MS: u64 = 500;
+
+// ---- signal-anchor pricing/sizing (pure; wired into place_live's Signal arm) ----
+// The exec_* twins mirror the legacy ask-arm formulas so byte-identity is testable.
+
+/// Signal mode, YES side: limit = signal entry + crossing allowance, API-clamped.
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+fn signal_yes_limit(signal_entry: f64, price_buf: f64) -> f64 {
+    (signal_entry + price_buf).min(0.99)
+}
+/// Signal mode, NO side (NO book prices = 1 - yes price).
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+fn signal_no_limit(signal_entry: f64, price_buf: f64) -> f64 {
+    ((1.0 - signal_entry) - price_buf).max(0.01)
+}
+/// Sizing off the SIGNAL price (legacy sizes off the drifted exec price).
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+fn signal_count(stake: f64, signal_entry: f64, max_count: i64) -> f64 {
+    (stake / signal_entry).round().clamp(1.0, max_count as f64)
+}
+/// Legacy formulas keyed on the exec (fresh-ask) price — for byte-identity assertions.
+#[cfg_attr(not(test), allow(dead_code))]
+fn exec_yes_limit(exec_entry: f64, price_buf: f64) -> f64 {
+    (exec_entry + price_buf).min(0.99)
+}
+#[cfg_attr(not(test), allow(dead_code))]
+fn exec_no_limit(exec_entry: f64, price_buf: f64) -> f64 {
+    ((1.0 - exec_entry) - price_buf).max(0.01)
+}
+#[cfg_attr(not(test), allow(dead_code))]
+fn exec_count(stake: f64, exec_entry: f64, max_count: i64) -> f64 {
+    (stake / exec_entry).round().clamp(1.0, max_count as f64)
+}
+/// Fail-open telemetry filter — same sanity band the legacy ask path applies.
+#[cfg_attr(not(test), allow(dead_code))] // wired in slice 2
+fn filtered_ask(ask: Option<f64>) -> Option<f64> {
+    ask.filter(|v| *v > 0.50 && *v <= 0.98)
 }
 
 /// Strict SUBACCOUNT parse: a present-but-garbage value REFUSES to start — the old
@@ -2392,7 +2455,62 @@ mod tests {
         assert_eq!(tw.pnl, Some(13.0));
         assert_eq!(lv.pnl, Some(0.55));
     }
+    // ---- exec-signal-anchor slice 1: selector + pure pricing/sizing ----
+
+    // TC-3.x: unknown value can NEVER select Signal on real money.
+    #[test]
+    fn select_exec_anchor_matrix() {
+        assert_eq!(select_exec_anchor(None), (ExecAnchor::Ask, None));
+        assert_eq!(select_exec_anchor(Some("")), (ExecAnchor::Ask, None));
+        assert_eq!(select_exec_anchor(Some("  ")), (ExecAnchor::Ask, None));
+        assert_eq!(select_exec_anchor(Some("ask")), (ExecAnchor::Ask, None));
+        assert_eq!(select_exec_anchor(Some("signal")), (ExecAnchor::Signal, None));
+        assert_eq!(select_exec_anchor(Some(" signal ")), (ExecAnchor::Signal, None));
+        let (a, w) = select_exec_anchor(Some("SIGNAL"));
+        assert_eq!(a, ExecAnchor::Ask);
+        assert!(w.is_some());
+        let (a, w) = select_exec_anchor(Some("sig"));
+        assert_eq!(a, ExecAnchor::Ask);
+        let w = w.unwrap();
+        assert!(w.contains("sig") && w.contains("ask") && w.contains("signal"));
+    }
+
+    // TC-1.1/1.2/9.x/10.1/12.1/13.1: pricing/sizing math incl. boundaries.
+    #[test]
+    fn signal_pricing_and_sizing_math() {
+        assert!((signal_yes_limit(0.92, 0.06) - 0.98).abs() < 1e-12); // band edge
+        assert!((signal_yes_limit(0.85, 0.06) - 0.91).abs() < 1e-12);
+        assert!((signal_yes_limit(0.55, 0.0) - 0.55).abs() < 1e-12); // buf 0 -> limit=signal
+        assert!((signal_yes_limit(0.95, 0.07) - 0.99).abs() < 1e-12); // clamp binds
+        assert!((signal_no_limit(0.92, 0.06) - 0.02).abs() < 1e-12);
+        assert!((signal_no_limit(0.55, 0.60) - 0.01).abs() < 1e-12); // huge buf -> floor
+        assert_eq!(signal_count(5.0, 0.90, 15), 6.0);
+        assert_eq!(signal_count(5.0, 0.92, 15), 5.0);
+        assert_eq!(signal_count(5.0, 0.51, 15), 10.0);
+        assert_eq!(signal_count(100.0, 0.60, 15), 15.0); // max_count cap
+        assert_eq!(signal_count(5.0, 4.9, 15), 1.0); // floor 1
+        // byte-identity: exec_* twins are the exact legacy formulas
+        for e in [0.55, 0.66, 0.85, 0.92, 0.98] {
+            for b in [0.0, 0.02, 0.06] {
+                assert_eq!(exec_yes_limit(e, b), (e + b).min(0.99));
+                assert_eq!(exec_no_limit(e, b), ((1.0 - e) - b).max(0.01));
+            }
+            assert_eq!(exec_count(5.0, e, 15), (5.0f64 / e).round().clamp(1.0, 15.0));
+        }
+    }
+
+    // TC-5.2: fail-open telemetry filter, same (0.50, 0.98] band as the legacy path.
+    #[test]
+    fn filtered_ask_band() {
+        assert_eq!(filtered_ask(Some(0.85)), Some(0.85));
+        assert_eq!(filtered_ask(Some(0.98)), Some(0.98)); // inclusive top
+        assert_eq!(filtered_ask(Some(0.99)), None);
+        assert_eq!(filtered_ask(Some(0.50)), None); // exclusive bottom
+        assert_eq!(filtered_ask(Some(0.10)), None);
+        assert_eq!(filtered_ask(None), None);
+    }
 }
+
 
 
 

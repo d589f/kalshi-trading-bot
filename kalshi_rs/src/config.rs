@@ -122,6 +122,25 @@ impl SessionSel {
     }
 }
 
+/// How the live IOC limit is anchored. `Ask` = legacy: re-fetch the fresh orderbook and
+/// price off the (possibly run-away) ask. `Signal` = price off the mirrored signal entry
+/// (the paper price) — no pre-order book fetch in the critical path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecAnchor {
+    Ask,
+    Signal,
+}
+
+/// Pure resolver for EXEC_ANCHOR: trimmed, case-sensitive; unknown → None (main()
+/// logs fail-loud and falls back to Ask — a typo must NEVER select Signal on real money).
+pub fn resolve_exec_anchor(name: &str) -> Option<ExecAnchor> {
+    match name.trim() {
+        "ask" => Some(ExecAnchor::Ask),
+        "signal" => Some(ExecAnchor::Signal),
+        _ => None,
+    }
+}
+
 /// Pure resolver: trimmed, case-sensitive exact match against the known session keys.
 /// Empty/unknown → None. Fail-loud logging and the f6 fallback are main()'s job —
 /// this module stays pure (no logging, no exit).
@@ -266,4 +285,18 @@ mod tests {
             "f1_d50cap75"
         );
     }
+    // exec-signal-anchor TC-2.x: closed set, trim, case-sensitive; unknown -> None.
+    #[test]
+    fn resolve_exec_anchor_matrix() {
+        assert_eq!(resolve_exec_anchor("ask"), Some(ExecAnchor::Ask));
+        assert_eq!(resolve_exec_anchor("signal"), Some(ExecAnchor::Signal));
+        assert_eq!(resolve_exec_anchor(" signal "), Some(ExecAnchor::Signal));
+        assert_eq!(resolve_exec_anchor(""), None);
+        assert_eq!(resolve_exec_anchor("   "), None);
+        assert_eq!(resolve_exec_anchor("ASK"), None);
+        assert_eq!(resolve_exec_anchor("Signal"), None);
+        assert_eq!(resolve_exec_anchor("sig"), None);
+        assert_eq!(resolve_exec_anchor("signal!"), None);
+    }
 }
+
