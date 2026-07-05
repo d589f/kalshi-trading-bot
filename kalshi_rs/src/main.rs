@@ -817,6 +817,12 @@ async fn kalshi_poller(state: Arc<Mutex<AppState>>, rest: Arc<KalshiRest>) {
     }
 }
 
+/// Twin latch decision: emit the shadow would-be once per window key; never emit
+/// without a window key.
+fn twin_should_emit(twin_window: Option<&str>, win_key: Option<&str>) -> bool {
+    win_key.is_some() && twin_window != win_key
+}
+
 /// Keep-predicate for the pending list after `pd` resolves: remove only rows matching
 /// ticker/side/entry AND the live flag — a twin resolve must never evict the live
 /// pending (they can share ticker/side/entry when eff == signal_entry).
@@ -927,6 +933,11 @@ async fn signal_loop(
     let mut attempt_window: Option<String> = None;
     let mut attempt_count: i64 = 0;
     let mut last_attempt_ts: f64 = f64::NEG_INFINITY;
+    // Shadow-twin latch: the would-be is emitted once per window (in-memory only —
+    // a mid-window restart of a NO-FILL window may re-emit one twin; accepted, the
+    // dashboard dedupes per window. Filled windows are covered by fired_window's
+    // persisted boot seed).
+    let mut twin_window: Option<String> = None;
 
     loop {
         tick.tick().await;
@@ -1137,10 +1148,24 @@ async fn signal_loop(
                 attempt_window = win_key.clone();
                 attempt_count = 0;
                 last_attempt_ts = f64::NEG_INFINITY;
+                twin_window = None;
             }
             let already = fired_window.as_deref() == win_key.as_deref();
             if !already && !book.ticker.is_empty() {
                 if lcfg.enabled && order_client.is_some() {
+                    // Honest shadow twin: record the strategy's would-be (live=false, its
+                    // own Pending scored on real settlement) ONCE per window, decoupled
+                    // from retry_gate and from place_live's fill/no-fill/skip outcome —
+                    // the green shadow line keeps moving even when the live order misses.
+                    // Inside `if !already`, so a boot-seeded filled-window restart skips
+                    // the twin along with the order (correct dedupe).
+                    if twin_should_emit(twin_window.as_deref(), win_key.as_deref()) {
+                        twin_window = win_key.clone();
+                        emit_trigger(
+                            &ledger, &pending, &cfg, &shared, &book, &win, &fire, now,
+                            now_utc, &dash, &session_tag,
+                        );
+                    }
                     if retry_gate(
                         attempt_count,
                         last_attempt_ts,
@@ -2261,7 +2286,19 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(!v[0].live, "live resolve evicted the twin pending");
     }
+    // ---- slice 3 (dashboard-f1-live-line): twin latch ----
+
+    // TC-6.5/8.x: once per window key; re-arms on window roll; never without a key.
+    #[test]
+    fn twin_latch_once_per_window() {
+        assert!(twin_should_emit(None, Some("W1"))); // first fire tick
+        assert!(!twin_should_emit(Some("W1"), Some("W1"))); // later ticks/retries: latched
+        assert!(twin_should_emit(Some("W1"), Some("W2"))); // window rolled: re-armed
+        assert!(!twin_should_emit(None, None)); // no window key -> never
+        assert!(!twin_should_emit(Some("W1"), None));
+    }
 }
+
 
 
 
