@@ -856,7 +856,9 @@ async fn signal_loop(
         if let Some(murl) = mcfg.url.as_deref() {
             // MIRROR: window_open / Δ / σ / book come straight from the paper engine,
             // so our (validated) f6 filter produces the SAME side + entry as the paper.
-            match mirror::fetch(&http, murl, now_utc).await {
+            // Session key literal is TEMPORARY (slice 2 compile fix) — slice 4 threads
+            // the resolved mirror_key here.
+            match mirror::fetch(&http, murl, now_utc, "f6_wait270").await {
                 Some(m) if m.age_secs <= mcfg.max_age_secs => {
                     win = window::WindowState {
                         window_start: Some(m.window_start),

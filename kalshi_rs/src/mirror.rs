@@ -22,6 +22,8 @@ pub struct MirrorSnap {
     pub binance_price: f64,
     pub delta_from_open: f64,
     pub delta_from_prev: f64,
+    /// The selected session's `live_sigma` (f6 → max30, f1 → max10). Field NAME is kept
+    /// for wire/struct compatibility — it is NOT always a max30 value.
     pub sigma_max30: f64,
     pub ticker: String,
     pub yes_bid: Option<f64>,
@@ -44,12 +46,28 @@ fn parse_ts(v: Option<&Value>) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-/// Fetch the f6 live signal from the paper engine. `base` e.g. "http://127.0.0.1:8893".
+/// Extract the mirrored session's `live_sigma` — FAIL-CLOSED. Returns Some only when
+/// the session key exists, the field is numeric, finite and strictly > 0.0. A real
+/// 0/negative sigma must NOT reach the gate: engine.rs's `.or(s.sigma)` fallback would
+/// silently swap in the LOCAL realized5 sigma — a non-F1 formula on real money.
+/// (Rejecting here keeps engine.rs untouched, per the architecture review.)
+pub fn extract_live_sigma(sessions_state: &Value, session_key: &str) -> Option<f64> {
+    let v = sessions_state.get(session_key)?.get("live_sigma")?.as_f64()?;
+    if v.is_finite() && v > 0.0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Fetch the selected session's live signal from the paper engine.
+/// `base` e.g. "http://127.0.0.1:8893"; `session_key` e.g. "f6_wait270" / "f1_d50cap75".
 /// Returns None on any error — the caller then SKIPS the tick rather than trade blind.
 pub async fn fetch(
     client: &reqwest::Client,
     base: &str,
     now_utc: DateTime<Utc>,
+    session_key: &str,
 ) -> Option<MirrorSnap> {
     let st: Value = client
         .get(format!("{base}/api/state"))
@@ -70,8 +88,9 @@ pub async fn fetch(
         .await
         .ok()?;
 
-    // f6's σ is the per-session max30 (top-level state['sigma'] is a different type).
-    let sigma = ss.get("f6_wait270")?.get("live_sigma")?.as_f64()?;
+    // The σ is the SELECTED session's per-session value (top-level state['sigma'] is a
+    // different type): f6 → max30, f1 → max10. Fail-closed on missing/non-positive.
+    let sigma = extract_live_sigma(&ss, session_key)?;
     let num = |k: &str| st.get(k).and_then(Value::as_f64);
 
     let last_update = parse_ts(st.get("last_update"))?;
@@ -97,4 +116,65 @@ pub async fn fetch(
         last_trade_expensive: num("poly_last_trade_expensive"),
         age_secs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ss() -> Value {
+        json!({
+            "f6_wait270":  {"live_sigma": 0.00056},
+            "f1_d50cap75": {"live_sigma": 0.00031}
+        })
+    }
+
+    // TC-3.1: happy path — the requested session's own sigma, no cross-talk.
+    #[test]
+    fn extract_happy_path_per_session() {
+        assert_eq!(extract_live_sigma(&ss(), "f1_d50cap75"), Some(0.00031));
+        assert_eq!(extract_live_sigma(&ss(), "f6_wait270"), Some(0.00056));
+    }
+
+    // TC-11.1: absent session key -> None, and NO fallback to another session that
+    // IS present in the payload (trading on the wrong strategy's sigma is fail-open).
+    #[test]
+    fn extract_missing_key_no_fallback() {
+        let s = json!({"f6_wait270": {"live_sigma": 0.00056}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+    }
+
+    // TC-3.5: session present, live_sigma field absent -> None.
+    #[test]
+    fn extract_missing_field() {
+        let s = json!({"f1_d50cap75": {"balance": 10000.0}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+    }
+
+    // TC-3.6 / TC-14.1: null / string-typed sigma -> None.
+    #[test]
+    fn extract_non_numeric() {
+        let s = json!({"f1_d50cap75": {"live_sigma": null}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+        let s = json!({"f1_d50cap75": {"live_sigma": "0.0003"}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+    }
+
+    // TC-14.2 / TC-14.5: FAIL-CLOSED on non-positive — exactly 0.0 and negative both
+    // rejected so the engine's .or(s.sigma) local fallback can never be reached.
+    #[test]
+    fn extract_non_positive_fail_closed() {
+        let s = json!({"f1_d50cap75": {"live_sigma": 0.0}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+        let s = json!({"f1_d50cap75": {"live_sigma": -3.1}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), None);
+    }
+
+    // Tiny-but-positive sigma is valid (real max10 values are ~1e-4).
+    #[test]
+    fn extract_tiny_positive_ok() {
+        let s = json!({"f1_d50cap75": {"live_sigma": 1e-9}});
+        assert_eq!(extract_live_sigma(&s, "f1_d50cap75"), Some(1e-9));
+    }
 }
