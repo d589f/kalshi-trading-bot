@@ -581,35 +581,40 @@ const LWC_JS: &str = include_str!("../static/lwc.js");
 const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <title>kalshi f1 term</title>
 <style>
- body{background:#000;color:#b8c0a8;font:13px/1.35 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:8px 10px}
- ::selection{background:#0f0;color:#000}
- .bar{color:#33ff66;white-space:pre-wrap;border-bottom:1px dashed #2f3b2f;padding-bottom:4px;margin-bottom:9px}
- .bar .host{background:#33ff66;color:#000;padding:0 6px;font-weight:700}
- .cur{display:inline-block;width:8px;background:#33ff66;animation:bl 1.1s steps(1) infinite}
+ body{background:#0000aa;color:#aaaaaa;font:13px/1.35 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:6px 8px}
+ ::selection{background:#00aaaa;color:#000}
+ .bar{background:#00aaaa;color:#000;padding:1px 8px;margin:-6px -8px 10px;font-weight:600;white-space:pre-wrap}
+ .bar .host{background:#0000aa;color:#55ffff;padding:0 6px}
+ .bar .dim{color:#004444}
+ .cur{display:inline-block;width:8px;background:#000;animation:bl 1.1s steps(1) infinite}
  @keyframes bl{50%{opacity:0}}
- .panes{display:flex;gap:9px;flex-wrap:wrap;align-items:stretch;margin-bottom:9px}
- .pane{border:1px solid #2f3b2f;padding:6px 9px 7px;min-width:230px;flex:1;background:#000}
- .pane.wide{flex:1.6;min-width:300px}
- .ptitle{color:#6a8f5f;margin:-14px 0 6px 2px;background:#000;display:inline-block;padding:0 6px}
+ .panes{display:flex;gap:8px;flex-wrap:wrap;align-items:stretch;margin-bottom:10px}
+ .pane{border:1px solid #55ffff;padding:7px 9px;min-width:230px;flex:1;background:#0000aa}
+ .ptitle{color:#55ffff;margin:-15px 0 6px 2px;background:#0000aa;display:inline-block;padding:0 6px;font-weight:600}
  .kv{display:flex;justify-content:space-between;gap:14px}
- .kv .k{color:#5f6b5f}
- .kv .v{font-weight:600;text-align:right;white-space:nowrap}
+ .kv .k{color:#aaaaaa}
+ .kv .v{font-weight:700;text-align:right;white-space:nowrap;color:#ffffff}
  .kv.big .v{font-size:16px}
- .green{color:#33ff66}.red{color:#ff5544}.blue{color:#58a6ff}.yellow{color:#e6c65c}.dim{color:#5f6b5f}
+ .green{color:#55ff55}.red{color:#ff5555}.blue{color:#55ffff}.yellow{color:#ffff55}.dim{color:#7777cc}
  table{border-collapse:collapse;width:100%;font-size:12px;margin:2px 0 4px}
- th,td{text-align:right;padding:1px 6px;border-bottom:1px dotted #16201a}
- th{color:#6a8f5f;font-weight:400;border-bottom:1px solid #2f3b2f}
- td.l,th.l{text-align:left} .sep{border-left:1px dashed #2f3b2f}
+ th,td{text-align:right;padding:1px 6px}
+ th{color:#ffff55;font-weight:400;border-bottom:1px solid #00aaaa}
+ td{border-bottom:1px solid #1414bb}
+ td.l,th.l{text-align:left} .sep{border-left:1px solid #00aaaa}
  .reason{font-weight:700}
- button{background:#000;color:#33ff66;border:1px solid #2f3b2f;padding:1px 10px;cursor:pointer;font:inherit}
- .hint{color:#4a544a;margin:3px 0 2px}
- .tip{position:absolute;z-index:60;display:none;background:#000;border:1px double #4a5f4a;padding:8px 10px;font-size:12px;line-height:1.4;pointer-events:none;max-width:340px;min-width:230px}
- .tip h4{margin:0 0 5px;font-size:12px;color:#b8c0a8;border-bottom:1px dashed #2f3b2f;padding-bottom:3px;font-weight:600}
- .tip h4 .mk{font-weight:400;color:#5f6b5f;font-size:11px}
- .tip .seg{margin:5px 0 1px;font-weight:600}
+ button{background:#00aaaa;color:#000;border:none;padding:1px 10px;cursor:pointer;font:inherit;font-weight:600}
+ .hint{color:#7777cc;margin:3px 0 2px}
+ .fbar{display:flex;gap:14px;margin:6px 0 0;color:#aaaaaa}
+ .fbar b{color:#ffffff;font-weight:400;margin-right:1px}
+ .fbar .fl{background:#00aaaa;color:#000;padding:0 8px;cursor:pointer}
+ .tip{position:absolute;z-index:60;display:none;background:#00aaaa;color:#000;border:2px double #55ffff;padding:8px 10px;font-size:12px;line-height:1.4;pointer-events:none;max-width:340px;min-width:230px}
+ .tip h4{margin:0 0 5px;font-size:12px;color:#000;border-bottom:1px solid #008888;padding-bottom:3px;font-weight:700}
+ .tip h4 .mk{font-weight:400;color:#004444;font-size:11px}
+ .tip .seg{margin:5px 0 1px;font-weight:700}
  .tip .row{display:flex;justify-content:space-between;gap:16px}
- .tip .lbl{color:#5f6b5f}
- .tip .none{color:#4a544a;font-style:italic}
+ .tip .lbl{color:#004444}
+ .tip .none{color:#006666;font-style:italic}
+ .tip .green{color:#005500}.tip .red{color:#aa0000}.tip .dim{color:#006666}
 </style></head><body>
 <div class=bar><span class=host> kalshi-f1@prod </span> LIVE $5 real · subacct#1 · mirror f1_d50cap75 · loss-stop $30<span class=cur>&nbsp;</span>
 <span id=sub class=dim>connecting…</span></div>
@@ -619,16 +624,16 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  <div class=pane><div class=ptitle>┌─[ signal ]──────────</div><div id=live></div></div>
 </div>
 <div class=pane style="margin-bottom:9px">
-<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#f778ba">paper F1</span> · <span class=green>shadow f6</span> · <span style="color:#ff7b72">LIVE F1 real (старт от точки F1)</span> ]───</div>
+<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#ff55ff">paper F1</span> · <span class=green>shadow f6</span> · <span style="color:#ff5555">LIVE F1 real (старт от точки F1)</span> ]───</div>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px"></div>
 <div id=tip class=tip></div>
 </div>
 <div class=hint><span id=chartlbl></span></div>
-<div class=hint>hover ~1s → детали окна · <button onclick=load()>refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
+<div class=fbar><span><b>1</b><span class=fl>Hover=Info</span></span><span><b>5</b><span class=fl onclick=load()>Refresh</span></span><span><b>9</b><label class=fl>Auto2s <input type=checkbox id=auto checked></label></span><span><b>10</b><span class=fl>Kalshi-F1</span></span></div>
 </div>
 <div class=pane>
-<div class=ptitle>┌─[ windows: <span style="color:#f778ba">paper F1</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
+<div class=ptitle>┌─[ windows: <span style="color:#ff55ff">paper F1</span> | <span style="color:#ff5555">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=f1</th>
@@ -652,17 +657,17 @@ let _chart=null, _S={}, _cmp=[], _tipTimer=null;
 function initChart(){
  const el=document.getElementById('chart');
  _chart=LightweightCharts.createChart(el,{
-   layout:{background:{type:'solid',color:'#000000'},textColor:'#6a8f5f',fontFamily:'ui-monospace,Menlo,monospace',fontSize:12},
-   grid:{vertLines:{color:'#101510'},horzLines:{color:'#101510'}},
-   rightPriceScale:{borderColor:'#2f3b2f'},
-   timeScale:{borderColor:'#2f3b2f',timeVisible:true,secondsVisible:false},
-   crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#8b949e',labelBackgroundColor:'#30363d'},horzLine:{color:'#8b949e',labelBackgroundColor:'#30363d'}},
+   layout:{background:{type:'solid',color:'#0000aa'},textColor:'#55ffff',fontFamily:'ui-monospace,Menlo,monospace',fontSize:12},
+   grid:{vertLines:{color:'#1414bb'},horzLines:{color:'#1414bb'}},
+   rightPriceScale:{borderColor:'#00aaaa'},
+   timeScale:{borderColor:'#00aaaa',timeVisible:true,secondsVisible:false},
+   crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#aaaaaa',labelBackgroundColor:'#00aaaa'},horzLine:{color:'#aaaaaa',labelBackgroundColor:'#00aaaa'}},
  });
  const mk=(c,t)=>_chart.addLineSeries({color:c,lineWidth:2,title:t,priceLineVisible:false,lastValueVisible:true,
    priceFormat:{type:'custom',formatter:v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(0)}});
- _S.paper=mk('#e3a008','paper'); _S.com=mk('#3fb950','SHADOW f6'); _S.f1=mk('#f778ba','F1'); _S.lv=mk('#ff7b72','LIVE');
+ _S.paper=mk('#ffff55','paper f6'); _S.com=mk('#55ff55','SHADOW f6'); _S.f1=mk('#ff55ff','F1'); _S.lv=mk('#ff5555','LIVE');
  // zero baseline
- _S.paper.createPriceLine({price:0,color:'#555',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
+ _S.paper.createPriceLine({price:0,color:'#7777cc',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
  _chart.applyOptions({width:el.clientWidth,height:340});
  setupTip();
@@ -698,7 +703,7 @@ function showTip(t,x,y){
 }
 function tseg(name,side,entry,delta,p,pnl,res,note){
  if(!side)return `<div class=seg style="color:#6e7681">${name}: <span class=none>не торговал это окно</span></div>`;
- const col=side=='YES'?'#3fb950':'#f85149';
+ const col=side=='YES'?'#005500':'#aa0000';
  const rcol=res=='WIN'?'green':res=='LOSS'?'red':'dim';
  let h=`<div class=seg style="color:${col}">${name}: ${side}${note||''}</div>`;
  h+=`<div class=row><span class=lbl>entry</span><span>${f(entry)}</span></div>`;
