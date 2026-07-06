@@ -131,6 +131,18 @@ fn exec_no_limit(exec_entry: f64, price_buf: f64) -> f64 {
 fn exec_count(stake: f64, exec_entry: f64, max_count: i64) -> f64 {
     (stake / exec_entry).round().clamp(1.0, max_count.max(1) as f64)
 }
+/// The entry the execution path works from: Signal mode uses the FROZEN per-window
+/// anchor (first fire tick's signal = closest to paper's 180s entry) so P0b retries
+/// re-strike the SAME price (PRD §4 AC-6) — the signal itself drifts with the market
+/// between attempts, and following it re-created the chase (+10.5c mean on retried
+/// windows, night of 05-06.07). Ask mode keeps the live current entry (legacy).
+fn anchored_entry(anchor: ExecAnchor, frozen: f64, current: f64) -> f64 {
+    match anchor {
+        ExecAnchor::Signal => frozen,
+        ExecAnchor::Ask => current,
+    }
+}
+
 /// Fail-open telemetry filter — same sanity band the legacy ask path applies.
 fn filtered_ask(ask: Option<f64>) -> Option<f64> {
     ask.filter(|v| *v > 0.50 && *v <= 0.98)
@@ -1026,6 +1038,9 @@ async fn signal_loop(
     // a mid-window restart may re-emit one shadow row; accepted, the dashboard
     // dedupes per window).
     let mut twin_window: Option<String> = None;
+    // Signal-mode execution anchor: FROZEN at the first fire tick of the window so
+    // retries re-strike the same price (reset with the retry state on window roll).
+    let mut anchor_entry: Option<f64> = None;
 
     loop {
         tick.tick().await;
@@ -1275,6 +1290,7 @@ async fn signal_loop(
                 attempt_window = win_key.clone();
                 attempt_count = 0;
                 last_attempt_ts = f64::NEG_INFINITY;
+                anchor_entry = None;
             }
             let already = fired_window.as_deref() == win_key.as_deref();
             if !already && !book.ticker.is_empty() {
@@ -1287,6 +1303,7 @@ async fn signal_loop(
                         lcfg.retry_cooldown_secs,
                     ) {
                         last_attempt_ts = now;
+                        let frozen = *anchor_entry.get_or_insert(fire.entry);
                         let outcome = place_live(
                             order_client.as_ref().unwrap(),
                             &lcfg,
@@ -1304,6 +1321,7 @@ async fn signal_loop(
                             &rest,
                             sel,
                             anchor,
+                            frozen,
                         )
                         .await;
                         if counts_as_attempt(outcome) {
@@ -1445,13 +1463,16 @@ async fn place_live(
     rest: &KalshiRest,
     sel: SessionSel,
     anchor: ExecAnchor,
+    anchor_entry: f64,
 ) -> Outcome {
     let session_tag = sel.session_tag();
     let side_str: &'static str = match fire.side {
         Side::Yes => "yes",
         Side::No => "no",
     };
-    let entry = fire.entry;
+    // Signal mode: everything (band, limit, sizing, records) keys off the FROZEN
+    // window anchor; ask mode is byte-identical legacy (current fire.entry).
+    let entry = anchored_entry(anchor, anchor_entry, fire.entry);
     // a context-only record for any skip/error/no-fill path (order fields set per-path below).
     // Self-contained (computes window strings on call) so the fill path stays unchanged.
     let ctx = |outcome: Outcome| {
@@ -2594,7 +2615,22 @@ mod tests {
         assert_eq!(signal_count(5.0, 0.8, -3), 1.0);
         assert_eq!(exec_count(5.0, 0.8, 0), 1.0);
     }
+    // PRD §4 AC-6 regression (user-caught retry-chase, night 05-06.07): the signal-mode
+    // execution entry is FROZEN per window — a retry must re-strike the first tick's
+    // price even when the live signal has drifted; ask mode follows the current entry.
+    #[test]
+    fn anchored_entry_freezes_signal_mode() {
+        assert_eq!(anchored_entry(ExecAnchor::Signal, 0.64, 0.80), 0.64);
+        assert_eq!(anchored_entry(ExecAnchor::Ask, 0.64, 0.80), 0.80);
+        // freeze mechanics: get_or_insert keeps the first value across retries
+        let mut a: Option<f64> = None;
+        assert_eq!(*a.get_or_insert(0.64), 0.64); // first attempt
+        assert_eq!(*a.get_or_insert(0.80), 0.64); // retry with drifted signal -> same anchor
+        a = None; // window roll re-arms
+        assert_eq!(*a.get_or_insert(0.71), 0.71);
+    }
 }
+
 
 
 
