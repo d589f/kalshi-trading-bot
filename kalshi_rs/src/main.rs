@@ -1019,12 +1019,20 @@ async fn signal_loop(
     anchor: ExecAnchor,
 ) {
     let session_tag = sel.session_tag();
+    // Tick cadence: TICK_SECS env (default legacy 0.3s). 0.1s in mirror mode cuts the
+    // average signal-pickup delay ~100ms — worth 1-3c on the steepest run-ups. Clamped
+    // to a sane band; the σ cache below keeps the paper engine's heavy endpoint at its
+    // own 0.3s cadence regardless of the tick rate.
+    let tick_secs = env_f64("TICK_SECS", STATE_TICK_SECS).clamp(0.05, 2.0);
+    info!("signal tick = {tick_secs}s");
+    // σ cache for the fast mirror tick (see mirror::SigmaCache).
+    let mut sigma_cache = mirror::SigmaCache::default();
     // The REFERENCE SHADOW: the f6 strategy is always evaluated alongside the selected
     // live strategy and emitted as a live=false would-be — the dashboard's green line
     // stays "shadow f6" regardless of which strategy trades live.
     let shadow_cfg = SessionSel::F6.config();
     let shadow_tag = SessionSel::F6.session_tag();
-    let mut tick = tokio::time::interval(Duration::from_secs_f64(STATE_TICK_SECS));
+    let mut tick = tokio::time::interval(Duration::from_secs_f64(tick_secs));
     // Restart latch: seed from the persisted last CONFIRMED fill. If that window is
     // still the current one (redeploy mid-window), the per-tick `fired_window ==
     // win_key` check skips it — no double order. A past window simply never matches.
@@ -1095,6 +1103,7 @@ async fn signal_loop(
                 now_utc,
                 &mcfg.session_key,
                 Some(SessionSel::F6.key()), // f6 = reference shadow for the green line
+                &mut sigma_cache,
             )
             .await
             {

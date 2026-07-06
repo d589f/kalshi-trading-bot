@@ -50,6 +50,40 @@ fn parse_ts(v: Option<&Value>) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// σ cache for the fast mirror tick: /api/sessions_state carries EVERY session with
+/// history (~30KB of Python serialization) — polling it at 10Hz would load the paper
+/// engine, the signal source for everything. σ is a 10/30-min window statistic: a
+/// sub-second-stale value is identical for the gate. Refresh every SIGMA_REFRESH_SECS;
+/// a value older than SIGMA_MAX_AGE_SECS fails CLOSED (tick skipped), preserving the
+/// no-blind-trades guarantee even if the sessions endpoint dies while /api/state lives.
+#[derive(Default)]
+pub struct SigmaCache {
+    pub primary: Option<f64>,
+    pub shadow: Option<f64>,
+    pub at: Option<DateTime<Utc>>,
+}
+
+pub const SIGMA_REFRESH_SECS: f64 = 0.3;
+pub const SIGMA_MAX_AGE_SECS: f64 = 3.0;
+
+/// Age of the cache in seconds (infinity when never filled).
+pub fn cache_age_secs(at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> f64 {
+    at.map(|t| (now - t).num_milliseconds() as f64 / 1000.0)
+        .unwrap_or(f64::INFINITY)
+}
+/// Is a refresh due? (>= so the cache refreshes on the paper's own update cadence)
+pub fn cache_due(age: f64) -> bool {
+    age >= SIGMA_REFRESH_SECS
+}
+/// FAIL-CLOSED read: a too-stale cache yields None regardless of the stored value.
+pub fn sigma_from_cache(v: Option<f64>, age: f64) -> Option<f64> {
+    if age <= SIGMA_MAX_AGE_SECS {
+        v
+    } else {
+        None
+    }
+}
+
 /// Extract the mirrored session's `live_sigma` — FAIL-CLOSED. Returns Some only when
 /// the session key exists, the field is numeric, finite and strictly > 0.0. A real
 /// 0/negative sigma must NOT reach the gate: engine.rs's `.or(s.sigma)` fallback would
@@ -78,7 +112,9 @@ pub async fn fetch(
     now_utc: DateTime<Utc>,
     session_key: &str,
     shadow_session_key: Option<&str>,
+    cache: &mut SigmaCache,
 ) -> Option<MirrorSnap> {
+    // Light state poll — every tick (this is what carries Δ/book/window, the fast data).
     let st: Value = client
         .get(format!("{base}/api/state"))
         .timeout(Duration::from_secs(3))
@@ -88,22 +124,27 @@ pub async fn fetch(
         .json()
         .await
         .ok()?;
-    let ss: Value = client
-        .get(format!("{base}/api/sessions_state"))
-        .timeout(Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-
-    // The σ is the SELECTED session's per-session value (top-level state['sigma'] is a
-    // different type): f6 → max30, f1 → max10. Fail-closed on missing/non-positive.
-    let sigma = extract_live_sigma(&ss, session_key)?;
-    // Reference-shadow σ (f6 max30) is best-effort — no `?`, absence just skips the
-    // shadow evaluation this tick.
-    let sigma_shadow = shadow_session_key.and_then(|k| extract_live_sigma(&ss, k));
+    // Heavy sessions poll — only when the σ cache is due; on failure the old cache
+    // survives until SIGMA_MAX_AGE_SECS, then the tick fails closed below.
+    if cache_due(cache_age_secs(cache.at, now_utc)) {
+        if let Ok(resp) = client
+            .get(format!("{base}/api/sessions_state"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            if let Ok(ss) = resp.json::<Value>().await {
+                cache.primary = extract_live_sigma(&ss, session_key);
+                cache.shadow = shadow_session_key.and_then(|k| extract_live_sigma(&ss, k));
+                cache.at = Some(now_utc);
+            }
+        }
+    }
+    let age = cache_age_secs(cache.at, now_utc);
+    // The σ is the SELECTED session's per-session value: f6 → max30, f1 → max10.
+    // Fail-closed on missing/non-positive/too-stale.
+    let sigma = sigma_from_cache(cache.primary, age)?;
+    let sigma_shadow = sigma_from_cache(cache.shadow, age);
     let num = |k: &str| st.get(k).and_then(Value::as_f64);
 
     let last_update = parse_ts(st.get("last_update"))?;
@@ -197,4 +238,19 @@ mod tests {
         assert_eq!(extract_live_sigma(&ok(1e300), "f1_d50cap75"), None);
         assert_eq!(extract_live_sigma(&ok(0.5), "f1_d50cap75"), None);
     }
+    // Fast-tick σ cache: refresh due at the paper's own cadence; stale reads fail CLOSED.
+    #[test]
+    fn sigma_cache_bounds() {
+        assert!(cache_due(f64::INFINITY)); // never filled -> refresh
+        assert!(cache_due(0.3));
+        assert!(!cache_due(0.1));
+        assert_eq!(sigma_from_cache(Some(0.0003), 0.1), Some(0.0003));
+        assert_eq!(sigma_from_cache(Some(0.0003), 2.9), Some(0.0003));
+        assert_eq!(sigma_from_cache(Some(0.0003), 3.1), None); // too stale -> skip tick
+        assert_eq!(sigma_from_cache(None, 0.0), None);
+        let now = Utc::now();
+        assert_eq!(cache_age_secs(None, now), f64::INFINITY);
+        assert!(cache_age_secs(Some(now - chrono::Duration::milliseconds(500)), now) - 0.5 < 0.01);
+    }
 }
+
