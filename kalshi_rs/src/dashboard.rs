@@ -624,7 +624,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  <div class=pane><div class=ptitle>┌─[ signal ]──────────</div><div id=live></div></div>
 </div>
 <div class=pane style="margin-bottom:9px">
-<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#d6409f">paper F1</span> · <span class=green>shadow f6</span> · <span style="color:#cf222e">LIVE F1 real (старт от точки F1)</span> ]───</div>
+<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#d6409f">paper F1 (сплошная=книга движка, пунктир=real)</span> · <span class=green>shadow f6</span> · <span style="color:#cf222e">LIVE F1 real (старт от точки F1)</span> ]───</div>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px"></div>
 <div id=tip class=tip></div>
@@ -663,9 +663,9 @@ function initChart(){
    timeScale:{borderColor:'#cccccc',timeVisible:true,secondsVisible:false},
    crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:'#999999',labelBackgroundColor:'#dddddd'},horzLine:{color:'#999999',labelBackgroundColor:'#dddddd'}},
  });
- const mk=(c,t)=>_chart.addLineSeries({color:c,lineWidth:2,title:t,priceLineVisible:false,lastValueVisible:true,
+ const mk=(c,t,ls)=>_chart.addLineSeries({color:c,lineWidth:2,lineStyle:ls||0,title:t,priceLineVisible:false,lastValueVisible:true,
    priceFormat:{type:'custom',formatter:v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(0)}});
- _S.paper=mk('#e3a008','paper f6'); _S.com=mk('#2da44e','SHADOW f6'); _S.f1=mk('#d6409f','F1'); _S.lv=mk('#cf222e','LIVE');
+ _S.paper=mk('#e3a008','paper f6'); _S.com=mk('#2da44e','SHADOW f6'); _S.f1=mk('#d6409f','F1'); _S.f1r=mk('#d6409f','F1 real',2); _S.lv=mk('#cf222e','LIVE');
  // zero baseline
  _S.paper.createPriceLine({price:0,color:'#cccccc',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
@@ -746,6 +746,9 @@ function updateChart(cmp){
   r.pa_twin=(r.pa_pnl!=null&&r.pa_entry)?twin5(r.pa_entry,r.pa_pnl>0):null;
   r.com_twin=(r.com_pnl!=null&&r.com_entry)?twin5(r.com_entry,(r.com_won!=null?r.com_won:r.com_pnl>0)):null;
   r.f1_twin=(r.f1_pnl!=null&&r.f1_entry)?twin5(r.f1_entry,r.f1_pnl>0):null;
+  // F1 real: тот же исход paper, но по РЕАЛЬНОЙ цене нашего филла (lv_entry).
+  // Окна без реального филла (фантомы устаревшей книги / пропуски) = нет сделки.
+  r.f1_real=(r.f1_pnl!=null&&r.lv_entry!=null)?twin5(r.lv_entry,r.f1_pnl>0):null;
  }
  const rows=cmp.slice().reverse();
  // gate=true would accumulate only on both-resolved windows; we plot ungated full history.
@@ -757,7 +760,7 @@ function updateChart(cmp){
  // Both lines run identical $5 Kalshi economics (integer contracts, Kalshi fee on win+loss,
  // loss=-cost) via twin5 on each side's own fill entry, so the remaining paper-vs-LIVE gap is
  // ONLY real slippage + no-fills, never a stake-scale artifact. US shadow dropped.
- _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin')); _S.f1.setData(build('f1_twin'));
+ _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin')); _S.f1.setData(build('f1_twin')); _S.f1r.setData(build('f1_real'));
  // LIVE line: REAL $5 fills (raw lv_pnl, no twin5 re-pricing), ANCHORED to start at the
  // pink paper-F1 cumulative just BEFORE the first visible live window — so the gap
  // LIVE-vs-pink = pure execution (slippage + no-fills + real fees). Recomputed each
@@ -782,7 +785,8 @@ function updateChart(cmp){
  _S.lv.setData(lvSeries);
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length, lvw=rows.filter(r=>r.lv_pnl!=null).length;
  const lvSum=rows.reduce((a,r)=>a+(r.lv_pnl||0),0);
- document.getElementById('chartlbl').textContent=`(paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`;
+ const f1rw=rows.filter(r=>r.f1_real!=null).length;
+ document.getElementById('chartlbl').textContent=`(paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
