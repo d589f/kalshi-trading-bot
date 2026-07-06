@@ -604,6 +604,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  .reason{font-weight:700}
  button{background:#e6e6e6;color:#111;border:1px solid #bbb;padding:1px 10px;cursor:pointer;font:inherit;font-weight:600}
  .hint{color:#999;margin:3px 0 2px}
+ .updrow td{background:#cf222e;color:#fff;text-align:center;font-weight:700;padding:2px 6px;border-bottom:none;letter-spacing:.4px}
  .fbar{display:flex;gap:14px;margin:6px 0 0;color:#777}
  .fbar b{color:#111;font-weight:700;margin-right:1px}
  .fbar .fl{background:#e6e6e6;color:#111;padding:0 8px;cursor:pointer;border:1px solid #ccc}
@@ -641,6 +642,14 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 </div>
 <script src="/lwc.js"></script>
 <script>
+// Деплой-маркеры бота: визуально отделяют позиции ДО и ПОСЛЕ обновлений.
+// Дописываются при каждом деплое (время UTC, минуты).
+const UPDATES=[
+ {t:'2026-07-05T21:00',label:'SIGNAL-ANCHOR (лимит от цены paper)'},
+ {t:'2026-07-06T10:30',label:'ANCHOR-FREEZE (ретрай в ту же цену)'},
+ {t:'2026-07-06T13:15',label:'WS BOOK FEED (книга пейпера real-time)'},
+ {t:'2026-07-06T21:00',label:'KILL-HOURS: live скипает 04/08/14/22 UTC'},
+];
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
 const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
 const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
@@ -761,6 +770,7 @@ function updateChart(cmp){
  // loss=-cost) via twin5 on each side's own fill entry, so the remaining paper-vs-LIVE gap is
  // ONLY real slippage + no-fills, never a stake-scale artifact. US shadow dropped.
  _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin')); _S.f1.setData(build('f1_twin')); _S.f1r.setData(build('f1_real'));
+ try{_S.paper.setMarkers(UPDATES.map(u=>({time:Math.floor(Date.parse(u.t+':00Z')/1000),position:'belowBar',color:'#cf222e',shape:'arrowUp',text:'upd'})));}catch(e){}
  // LIVE line: REAL $5 fills (raw lv_pnl, no twin5 re-pricing), ANCHORED to start at the
  // pink paper-F1 cumulative just BEFORE the first visible live window — so the gap
  // LIVE-vs-pink = pure execution (slippage + no-fills + real fees). Recomputed each
@@ -827,11 +837,24 @@ async function load(){
   +card('Δ open',f(L.delta_open),rc(L.delta_open))+card('τ',f(L.tau,2))+card('elapsed',f(L.elapsed,1))
   +card('σ',f(L.sigma_max30,6))+card('p',f(L.p,3))+card('yes/no ask',f(L.yes_ask)+'/'+f(L.no_ask));
  updateChart(d.compare);
- document.getElementById('cmp').innerHTML=d.compare.slice(0,60).map(c=>
-   `<tr><td class=l>${c.window}</td>
+ {
+  const rows=d.compare.slice(0,60);
+  let html='';let prevW=null;
+  for(const c of rows){
+   for(const u of UPDATES){
+    // маркер стоит между окном новее (prevW) и текущим окном (или над самым свежим)
+    if((prevW===null&&u.t>=c.window)||(prevW!==null&&u.t<prevW&&u.t>=c.window)){
+     html+=`<tr class=updrow><td colspan=13>─── ОБНОВЛЕНИЕ ${u.t.slice(5).replace('T',' ')}Z · ${u.label} ───</td></tr>`;
+    }
+   }
+   html+=`<tr><td class=l>${c.window}</td>
     <td class="sep ${sc(c.f1_side)}">${c.f1_side||'—'}</td><td>${f(c.f1_entry)}</td><td>${f(c.f1_delta,1)}</td><td class="${rc(c.f1_pnl)}">${c.f1_pnl==null?'…':(c.f1_pnl>=0?'+':'')+f(c.f1_pnl)}</td>
     <td class="sep ${sc(c.lv_side)}">${c.lv_side||'—'}</td><td>${f(c.lv_entry)}</td><td>${f(c.lv_delta,1)}</td><td>${mk(c.match_lv)}</td>
-    <td class="sep ${sc(c.com_side)}">${c.com_side||'—'}</td><td>${f(c.com_entry)}</td><td>${f(c.com_delta,1)}</td><td>${mk(c.match_com)}</td></tr>`).join('');
+    <td class="sep ${sc(c.com_side)}">${c.com_side||'—'}</td><td>${f(c.com_entry)}</td><td>${f(c.com_delta,1)}</td><td>${mk(c.match_com)}</td></tr>`;
+   prevW=c.window;
+  }
+  document.getElementById('cmp').innerHTML=html;
+ }
  }catch(e){document.getElementById('sub').textContent='fetch error: '+e}
 }
 load();setInterval(()=>{if(document.getElementById('auto').checked)load()},2000);

@@ -148,6 +148,38 @@ fn filtered_ask(ask: Option<f64>) -> Option<f64> {
     ask.filter(|v| *v > 0.50 && *v <= 0.98)
 }
 
+/// Parse KILL_HOURS ("4,8,14,22") — UTC hours the LIVE gate must skip (toxic-hours
+/// filter, split-half + f6-cross-validated). Fail-SAFE: any invalid token disables the
+/// whole filter (empty vec = today's behavior) with a loud warning — a typo must not
+/// silently skip the wrong hours. Deliberate LIVE-only divergence from paper.
+fn parse_kill_hours(env_val: Option<&str>) -> (Vec<i32>, Option<String>) {
+    let raw = env_val.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut out: Vec<i32> = Vec::new();
+    for tok in raw.split(',') {
+        match tok.trim().parse::<i32>() {
+            Ok(h) if (0..=23).contains(&h) => {
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+            _ => {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "KILL_HOURS='{raw}' has an invalid token '{}' (hours must be 0..23, comma-separated) — filter DISABLED",
+                        tok.trim()
+                    )),
+                );
+            }
+        }
+    }
+    out.sort_unstable();
+    (out, None)
+}
+
 /// Strict SUBACCOUNT parse: a present-but-garbage value REFUSES to start — the old
 /// silent 0 default would route real orders to the PRIMARY account, defeating the
 /// subaccount isolation (security audit, MEDIUM).
@@ -592,6 +624,16 @@ async fn main() -> Result<()> {
     }
     let mut cfg = session_sel.config();
     cfg.max_entry_price = resolve_max_entry(cfg.max_entry_price, std::env::var("MAX_ENTRY").ok());
+    // Toxic-hours filter: the LIVE gate skips windows in these UTC hours (paper engine
+    // untouched — this is a deliberate live-only edge over the reference strategy).
+    let (kill_hours, kh_warn) = parse_kill_hours(std::env::var("KILL_HOURS").ok().as_deref());
+    if let Some(w) = &kh_warn {
+        error!("{w}");
+    }
+    if !kill_hours.is_empty() {
+        cfg.kill_hours = kill_hours;
+        info!("toxic-hours filter ON — gate blocks UTC hours {:?}", cfg.kill_hours);
+    }
     info!(
         "session '{}': entry_wait={}min delta>={} p>={} sigma={} max_entry={} stake=${}",
         cfg.name,
@@ -2638,7 +2680,47 @@ mod tests {
         a = None; // window roll re-arms
         assert_eq!(*a.get_or_insert(0.71), 0.71);
     }
+    // ---- toxic-hours filter ----
+
+    // Fail-safe parse: invalid token disables the WHOLE filter (never skip wrong hours).
+    #[test]
+    fn parse_kill_hours_matrix() {
+        assert_eq!(parse_kill_hours(None), (vec![], None));
+        assert_eq!(parse_kill_hours(Some("")), (vec![], None));
+        assert_eq!(parse_kill_hours(Some("4,8,14,22")), (vec![4, 8, 14, 22], None));
+        assert_eq!(parse_kill_hours(Some(" 22, 4 ,8,14 ")), (vec![4, 8, 14, 22], None));
+        assert_eq!(parse_kill_hours(Some("4,4,8")), (vec![4, 8], None)); // dedup
+        let (v, w) = parse_kill_hours(Some("4,25"));
+        assert!(v.is_empty() && w.is_some()); // out of range -> disabled + warn
+        let (v, w) = parse_kill_hours(Some("4,o8"));
+        assert!(v.is_empty() && w.unwrap().contains("o8"));
+    }
+
+    // Gate blocks in a killed hour and trades in the next one (engine regime_block).
+    #[test]
+    fn kill_hours_block_f1_gate() {
+        let mut cfg = SessionConfig::f1_d50cap75();
+        cfg.kill_hours = vec![14, 22];
+        let mut s = Shared {
+            binance_price: Some(100_000.0),
+            delta_from_open: Some(60.0),
+            delta_from_prev: Some(30.0),
+            tau: 2.0,
+            elapsed_min: 3.5,
+            hour: 14,
+            yes_ask: Some(0.85),
+            no_ask: Some(0.10),
+            ..Default::default()
+        };
+        s.sigmas.insert("max10".to_string(), 0.0002);
+        let r = evaluate(&cfg, &s);
+        assert!(r.reason.starts_with("HOUR-BLOCK"), "{}", r.reason);
+        assert!(r.fire.is_none());
+        s.hour = 15;
+        assert_eq!(evaluate(&cfg, &s).reason, "BUY YES");
+    }
 }
+
 
 
 
