@@ -3,7 +3,7 @@
 ## Branch: feat/live-f1-strategy (off feat/dashboard-f1-compare @ 38bee0c)
 
 ## Feature: exec-signal-anchor — IOC limit = signal±PRICE_BUF, no pre-order book GET (concurrent telemetry, timeout 500ms), requote off in signal mode. EXEC_ANCHOR env default ask=legacy. Branch feat/exec-signal-anchor (off dashboard-f1-live-line 706ad1d), bootstrap c4c5dde, plan .claude/plan-exec-signal-anchor.md.
-## Status: COMPLETE — EXEC_ANCHOR=signal LIVE on EU since 2026-07-05T21:00:03Z (PID 1187023).
+## Status: exec-signal-anchor COMPLETE + follow-ups deployed 06.07: anchor-freeze f16fc84 (retry-chase killed, 10:30Z), fast tick TICK_SECS=0.1 f3807b9 (12:00Z), PAPER ENGINE WS BOOK FEED (13:15Z — tools/paper-engine/, engine's REST book lagged 8-16c on dumps => phantom paper fills; pink overstated ~$11/day; now sub-second). Dashboard: F1-real dashed line 893aa4d; light theme. ENGINE RESTART GOTCHA: ~30-40min WARMUP, sessions frozen, live_sigma=0, bot fails closed — restart only when acceptable. Missed windows 13:15-13:55 due to this warmup (safe).
 ## Slices: S1 848d6d2 (selector+helpers), S2 3375cca (place_live fork: ask arm verbatim / signal arm join!(create_ioc, timeout500ms book GET), requote off), S3 3c76186 (regression guard), review PASS 0crit/0major -> e1cc5b9 (MAX_COUNT<1 clamp panic guard + markers) + runbook w/ deploy ts. 84 tests.
 ## WATCH (first ~20 fills): eff <= signal_entry+0.06 per fill; drift tail >6c gone; no-fill rate vs paper F1 coverage (pre-fix 20/21); latency_ms drop (no book RTT); deploy-ts boundary for ask/signal ledger segmentation = 2026-07-05T21:00:03Z.
 ### W1 S1: config.rs ExecAnchor+resolver; main.rs select_exec_anchor + pure pricing helpers + TELEMETRY_TIMEOUT_MS [SECURITY] — pending
