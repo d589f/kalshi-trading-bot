@@ -330,6 +330,7 @@ impl Dash {
                     "com_ts": c.map(|x| x.ts_iso.clone()),
                     "f1_side": f1.map(|x| x.side.to_uppercase()),
                     "f1_entry": f1.map(|x| x.entry_price),
+                    "f1_delta": f1.map(|x| x.delta),
                     "f1_pnl": f1.and_then(|x| x.pnl),
                     "f1_p": f1.and_then(|x| x.p_model),
                     "f1_result": f1.and_then(|x| x.result.clone()),
@@ -627,7 +628,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=hint>hover ~1s → детали окна · <button onclick=load()>refresh</button> <label><input type=checkbox id=auto checked> auto 2s</label></div>
 </div>
 <div class=pane>
-<div class=ptitle>┌─[ windows: <span class=yellow>paper f6</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
+<div class=ptitle>┌─[ windows: <span style="color:#f778ba">paper F1</span> | <span style="color:#ff7b72">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=f1</th>
@@ -819,7 +820,7 @@ async function load(){
  updateChart(d.compare);
  document.getElementById('cmp').innerHTML=d.compare.slice(0,60).map(c=>
    `<tr><td class=l>${c.window}</td>
-    <td class="sep ${sc(c.pa_side)}">${c.pa_side||'—'}</td><td>${f(c.pa_entry)}</td><td>${f(c.pa_delta,1)}</td><td class="${rc(c.pa_pnl)}">${c.pa_pnl==null?'…':(c.pa_pnl>=0?'+':'')+f(c.pa_pnl)}</td>
+    <td class="sep ${sc(c.f1_side)}">${c.f1_side||'—'}</td><td>${f(c.f1_entry)}</td><td>${f(c.f1_delta,1)}</td><td class="${rc(c.f1_pnl)}">${c.f1_pnl==null?'…':(c.f1_pnl>=0?'+':'')+f(c.f1_pnl)}</td>
     <td class="sep ${sc(c.lv_side)}">${c.lv_side||'—'}</td><td>${f(c.lv_entry)}</td><td>${f(c.lv_delta,1)}</td><td>${mk(c.match_lv)}</td>
     <td class="sep ${sc(c.com_side)}">${c.com_side||'—'}</td><td>${f(c.com_entry)}</td><td>${f(c.com_delta,1)}</td><td>${mk(c.match_com)}</td></tr>`).join('');
  }catch(e){document.getElementById('sub').textContent='fetch error: '+e}
