@@ -631,7 +631,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div id=tip class=tip></div>
 </div>
 <div class=hint><span id=chartlbl></span></div>
-<div class=fbar><span><b>1</b><span class=fl>Hover=Info</span></span><span><b>5</b><span class=fl onclick=load()>Refresh</span></span><span><b>9</b><label class=fl>Auto2s <input type=checkbox id=auto checked></label></span><span><b>10</b><span class=fl>Kalshi-F1</span></span></div>
+<div class=fbar><span><b>1</b><span class=fl>Hover=Info</span></span><span><b>5</b><span class=fl onclick=load()>Refresh</span></span><span><b>7</b><label class=fl>FULL история <input type=checkbox id=fullhist onchange="if(_cmp){updateChart(_cmp);if(_chart)_chart.timeScale().fitContent();}"></label></span><span><b>9</b><label class=fl>Auto2s <input type=checkbox id=auto checked></label></span><span><b>10</b><span class=fl>Kalshi-F1</span></span></div>
 </div>
 <div class=pane>
 <div class=ptitle>┌─[ windows: <span style="color:#d6409f">paper F1</span> | <span style="color:#cf222e">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
@@ -759,31 +759,43 @@ function updateChart(cmp){
   // Окна без реального филла (фантомы устаревшей книги / пропуски) = нет сделки.
   r.f1_real=(r.f1_pnl!=null&&r.lv_entry!=null)?twin5(r.lv_entry,r.f1_pnl>0):null;
  }
- const rows=cmp.slice().reverse();
- // gate=true would accumulate only on both-resolved windows; we plot ungated full history.
+ // ---- режим отображения ----
+ // По умолчанию: "с апдейта" — только окна с момента ПОСЛЕДНЕГО деплой-маркера (UPDATES),
+ // и каждая из 5 линий стартует с $0 в этой точке. Общий ноль = честное сравнение роста
+ // после обновы, без исторического груза. Чекбокс "FULL история" (нижняя панель) — прежний
+ // вид: вся история, LIVE заякорен к розовой точке F1.
+ const full=!!(document.getElementById('fullhist')&&document.getElementById('fullhist').checked);
+ const CUT=UPDATES.map(u=>u.t).sort()[UPDATES.length-1]||'';
+ const rowsAll=cmp.slice().reverse();
+ // r.window и CUT — один формат 'YYYY-MM-DDTHH:MM', лексикографика = хронология.
+ // Когда 300-строчный кап уедет за CUT, фильтр станет no-op — но к тому моменту
+ // появится и более свежий маркер очередного деплоя.
+ const rows=full?rowsAll:rowsAll.filter(r=>r.window>=CUT);
+ // gate=true would accumulate only on both-resolved windows; we plot ungated.
  const build=(k,sc,gate)=>{sc=sc||1;let t=0;const out=[];let last=null;for(const r of rows){const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue; const both=(r.pa_pnl!=null&&r.com_pnl!=null); if(r[k]!=null&&(!gate||both))t+=r[k]*sc; if(ts!==last){out.push({time:ts,value:+t.toFixed(2)});last=ts;}else if(out.length){out[out.length-1].value=+t.toFixed(2);}} return out;};
  const tot=(k,sc,gate)=>{const a=build(k,sc,gate);return a.length?a[a.length-1].value:0};
- // FULL history (ungated): every trade is its own step on each line, so all paper
- // losses show and the curve never goes flat just because the other side no-filled.
- // The no-fill coverage gap is now visible (paper pulls ahead where LIVE missed a fill).
- // Both lines run identical $5 Kalshi economics (integer contracts, Kalshi fee on win+loss,
- // loss=-cost) via twin5 on each side's own fill entry, so the remaining paper-vs-LIVE gap is
- // ONLY real slippage + no-fills, never a stake-scale artifact. US shadow dropped.
+ // Every trade is its own step on each line, so all paper losses show and the curve never
+ // goes flat just because the other side no-filled. Both lines run identical $5 Kalshi
+ // economics (integer contracts, Kalshi fee on win+loss, loss=-cost) via twin5 on each
+ // side's own fill entry, so the remaining paper-vs-LIVE gap is ONLY real slippage +
+ // no-fills, never a stake-scale artifact.
  _S.paper.setData(build('pa_twin')); _S.com.setData(build('com_twin')); _S.f1.setData(build('f1_twin')); _S.f1r.setData(build('f1_real'));
- try{_S.paper.setMarkers(UPDATES.map(u=>({time:Math.floor(Date.parse(u.t+':00Z')/1000),position:'belowBar',color:'#cf222e',shape:'arrowUp',text:'upd'})));}catch(e){}
- // LIVE line: REAL $5 fills (raw lv_pnl, no twin5 re-pricing), ANCHORED to start at the
- // pink paper-F1 cumulative just BEFORE the first visible live window — so the gap
- // LIVE-vs-pink = pure execution (slippage + no-fills + real fees). Recomputed each
- // refresh; when the first live window scrolls out of the 300-row cap both re-baseline
- // together (relative gap preserved; authoritative absolute = LIVE fills card).
+ try{_S.paper.setMarkers((full?UPDATES:UPDATES.filter(u=>u.t>=CUT)).map(u=>({time:Math.floor(Date.parse(u.t+':00Z')/1000),position:'belowBar',color:'#cf222e',shape:'arrowUp',text:'upd'})));}catch(e){}
+ // LIVE line: REAL $5 fills (raw lv_pnl, no twin5 re-pricing).
+ //  - "с апдейта": кумулятив от $0 с точки среза — общий ноль со всеми линиями; плоские
+ //    участки = окна без входа (kill-hours / no-fill / p-фильтр).
+ //  - FULL: заякорен к розовой кумулятиве F1 строго ПЕРЕД первым видимым live-окном, так
+ //    разрыв LIVE-vs-pink = чистая экзекуция (slippage + no-fills + реальные fees).
  // NOTE: even at zero slippage LIVE needn't sit exactly on pink — twin5 models
  // round($5/e) cap 15 + modeled fee vs the ACTUAL filled count and actual fee.
  const lvSeries=[];{
-  let f1c=0, anchor=null, lt=0, last=null;
+  let f1c=0, anchor=full?null:0, lt=0, last=null;
   for(const r of rows){
    const ts=Math.floor(Date.parse(r.window+':00Z')/1000); if(!ts)continue;
-   if(anchor===null && r.lv_pnl!=null) anchor=+f1c.toFixed(2); // pink cum STRICTLY BEFORE this window (0 if none)
-   if(r.f1_twin!=null) f1c+=r.f1_twin;
+   if(full){
+    if(anchor===null && r.lv_pnl!=null) anchor=+f1c.toFixed(2); // pink cum STRICTLY BEFORE this window (0 if none)
+    if(r.f1_twin!=null) f1c+=r.f1_twin;
+   }
    if(anchor!==null){
     if(r.lv_pnl!=null) lt+=r.lv_pnl;
     const v=+(anchor+lt).toFixed(2);
@@ -796,7 +808,9 @@ function updateChart(cmp){
  const paw=rows.filter(r=>r.pa_pnl!=null).length, cow=rows.filter(r=>r.com_pnl!=null).length, lvw=rows.filter(r=>r.lv_pnl!=null).length;
  const lvSum=rows.reduce((a,r)=>a+(r.lv_pnl||0),0);
  const f1rw=rows.filter(r=>r.f1_real!=null).length;
- document.getElementById('chartlbl').textContent=`(paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`;
+ document.getElementById('chartlbl').textContent=full
+  ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`
+  :`(с апдейта ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE ${money(lvSum)}/${lvw}w · вся история — чекбокс FULL внизу)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
