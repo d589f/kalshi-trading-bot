@@ -111,7 +111,10 @@ def btc_path(start_ms, end_ms, symbol="BTCUSDT"):
                             c = line.split(",")
                             ts = int(c[0])
                             while ts > 2_000_000_000_000: ts //= 1000   # us -> ms
-                            P[ts // 60000] = float(c[4])                 # minute index -> close
+                            # kline keyed by OPEN time but c[4] is the CLOSE = price at the END
+                            # of the minute -> store under minute+1 so P[i] = price AT minute i.
+                            # (The old P[ts//60000]=close gave every caller a 60s LOOKAHEAD.)
+                            P[ts // 60000 + 1] = float(c[4])
             except Exception: pass
         day += _dt.timedelta(days=1)
     return P
