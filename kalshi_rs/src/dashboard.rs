@@ -649,6 +649,8 @@ const UPDATES=[
  {t:'2026-07-06T10:30',label:'ANCHOR-FREEZE (ретрай в ту же цену)'},
  {t:'2026-07-06T13:15',label:'WS BOOK FEED (книга пейпера real-time)'},
  {t:'2026-07-06T21:00',label:'KILL-HOURS: live скипает 04/08/14/22 UTC'},
+ {t:'2026-07-08T16:30',label:'LIVE ON без стоп-лосса (по решению)'},
+ {t:'2026-07-09T10:00',label:'KILL-HOURS → только 14 UTC (82д: 4/8/22 зелёные)'},
 ];
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
 const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
