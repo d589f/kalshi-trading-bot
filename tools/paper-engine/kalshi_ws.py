@@ -113,7 +113,18 @@ async def consume_kalshi_ticker_ws():
 
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=2)
+                        # any inbound frame proves the connection is alive
+                        with state_lock:
+                            if state.get("kalshi_ws_ts"):
+                                state["kalshi_ws_ts"] = time.time()
                     except asyncio.TimeoutError:
+                        # ticker is CHANGE-based: silence on a live connection
+                        # means "no quote change", not staleness. Keep the
+                        # freshness stamp alive so the fill gate only fires on
+                        # real disconnects (reconnect loop stops stamping).
+                        with state_lock:
+                            if state.get("kalshi_ws_ts"):
+                                state["kalshi_ws_ts"] = time.time()
                         continue
                     try:
                         d = json.loads(msg)

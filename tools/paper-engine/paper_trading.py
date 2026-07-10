@@ -910,7 +910,7 @@ def check_all_sessions(shared):
                               shared.get("market_slug"))
 
 
-BOOK_STALE_SECS = float(_os.getenv("BOOK_STALE_SECS", "2.0"))
+BOOK_STALE_SECS = float(_os.getenv("BOOK_STALE_SECS", "4.0"))
 
 
 def _try_open(sid, signal, side, entry_price, confidence, delta, window_start, ob_shares=0, market_slug=None):
