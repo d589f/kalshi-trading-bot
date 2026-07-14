@@ -652,6 +652,9 @@ const UPDATES=[
  {t:'2026-07-08T16:30',label:'LIVE ON без стоп-лосса (по решению)'},
  {t:'2026-07-09T10:00',label:'KILL-HOURS → только 14 UTC (82д: 4/8/22 зелёные)'},
 ];
+// нулевая точка zero-view БЕЗ визуального маркера (включение live 14.07 после пополнения):
+// участвует только в выборе среза CUT, в UPDATES не входит => ни стрелки, ни строки в таблице.
+const CHART_ZERO='2026-07-14T07:45';
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
 const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
 const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
@@ -767,7 +770,7 @@ function updateChart(cmp){
  // после обновы, без исторического груза. Чекбокс "FULL история" (нижняя панель) — прежний
  // вид: вся история, LIVE заякорен к розовой точке F1.
  const full=!!(document.getElementById('fullhist')&&document.getElementById('fullhist').checked);
- const CUT=UPDATES.map(u=>u.t).sort()[UPDATES.length-1]||'';
+ const CUT=[...UPDATES.map(u=>u.t),CHART_ZERO].sort().pop()||'';
  const rowsAll=cmp.slice().reverse();
  // r.window и CUT — один формат 'YYYY-MM-DDTHH:MM', лексикографика = хронология.
  // Когда 300-строчный кап уедет за CUT, фильтр станет no-op — но к тому моменту
@@ -812,7 +815,7 @@ function updateChart(cmp){
  const f1rw=rows.filter(r=>r.f1_real!=null).length;
  document.getElementById('chartlbl').textContent=full
   ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`
-  :`(с апдейта ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE ${money(lvSum)}/${lvw}w · вся история — чекбокс FULL внизу)`;
+  :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE ${money(lvSum)}/${lvw}w · вся история — чекбокс FULL внизу)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
