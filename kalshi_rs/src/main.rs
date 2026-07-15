@@ -1732,7 +1732,10 @@ async fn place_live(
         Side::No => 1.0 - resp.avg_price().unwrap_or(1.0 - entry),
     };
     let eff = (eff * 10000.0).round() / 10000.0;
-    let fee = resp.fee();
+    // resp.fee() under-reports (order-ack carries a per-contract figure, e.g.
+    // $0.0152 for a 6-lot vs the $0.0914 actually charged at settlement); log
+    // the real fee via the same schedule the resolver uses for pnl.
+    let fee = kalshi_fee_usd(fill, eff);
     {
         let mut s = live_state.lock().unwrap();
         record_fill_state(&mut s, win.window_start.map(|w| w.to_rfc3339()));

@@ -33,8 +33,12 @@ pub fn kalshi_fee_usd(contracts: f64, price: f64) -> f64 {
     if price <= 0.0 || price >= 1.0 || contracts <= 0.0 {
         return 0.0;
     }
-    let cents = 0.07 * contracts * price * (1.0 - price) * 100.0;
-    cents.ceil() / 100.0
+    // Kalshi charges 0.07·C·P·(1−P) rounded UP to 1/100 of a cent — verified
+    // against real settlement fee_cost (6@0.89 → $0.0412, 6@0.32 → $0.0914).
+    // The old round-up-to-whole-cent over-charged ~1c/trade (pessimistic pnl +
+    // an over-early daily loss stop).
+    let subcents = 0.07 * contracts * price * (1.0 - price) * 10000.0;
+    subcents.ceil() / 10000.0
 }
 
 fn best(levels: &[Level]) -> Option<Level> {

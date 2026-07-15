@@ -637,7 +637,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=ptitle>┌─[ windows: <span style="color:#d6409f">paper F1</span> | <span style="color:#cf222e">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
- <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>=f1</th>
+ <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>pnl</th><th>=f1</th>
  <th class=sep>SHADOW</th><th>entry</th><th>Δ</th><th>=pa</th></tr></thead><tbody id=cmp></tbody></table>
 </div>
 <script src="/lwc.js"></script>
@@ -665,7 +665,7 @@ const mk=(b)=>b===true?'<span class=green>✓</span>':b===false?'<span class=red
 // as the live bot (integer count=round($5/entry) cap 15, Kalshi fee on win AND loss, loss=-cost),
 // then ×20 BOTH curves. This strips the accounting-model artifacts (fractional shares, Polymarket
 // fee, -$100 flat loss) so paper-vs-LIVE shows only the REAL gap: slippage + no-fills.
-function kfee(c,p){return (p<=0||p>=1||c<=0)?0:Math.ceil(0.07*c*p*(1-p)*100)/100;}
+function kfee(c,p){return (p<=0||p>=1||c<=0)?0:Math.ceil(0.07*c*p*(1-p)*10000)/10000;}
 function twin5(entry,won){if(entry==null||entry<=0)return null;let c=Math.round(5/entry);if(c<1)c=1;if(c>15)c=15;const cost=c*entry+kfee(c,entry);return won?(c-cost):(-cost);}
 let _chart=null, _S={}, _cmp=[], _tipTimer=null;
 function initChart(){
@@ -863,12 +863,12 @@ async function load(){
    for(const u of UPDATES){
     // маркер стоит между окном новее (prevW) и текущим окном (или над самым свежим)
     if((prevW===null&&u.t>=c.window)||(prevW!==null&&u.t<prevW&&u.t>=c.window)){
-     html+=`<tr class=updrow><td colspan=13>─── ОБНОВЛЕНИЕ ${u.t.slice(5).replace('T',' ')}Z · ${u.label} ───</td></tr>`;
+     html+=`<tr class=updrow><td colspan=14>─── ОБНОВЛЕНИЕ ${u.t.slice(5).replace('T',' ')}Z · ${u.label} ───</td></tr>`;
     }
    }
    html+=`<tr><td class=l>${c.window}</td>
     <td class="sep ${sc(c.f1_side)}">${c.f1_side||'—'}</td><td>${f(c.f1_entry)}</td><td>${f(c.f1_delta,1)}</td><td class="${rc(c.f1_pnl)}">${c.f1_pnl==null?'…':(c.f1_pnl>=0?'+':'')+f(c.f1_pnl)}</td>
-    <td class="sep ${sc(c.lv_side)}">${c.lv_side||'—'}</td><td>${f(c.lv_entry)}</td><td>${f(c.lv_delta,1)}</td><td>${mk(c.match_lv)}</td>
+    <td class="sep ${sc(c.lv_side)}">${c.lv_side||'—'}</td><td>${f(c.lv_entry)}</td><td>${f(c.lv_delta,1)}</td><td class="${rc(c.lv_pnl)}">${c.lv_pnl==null?(c.lv_side?'…':'—'):(c.lv_pnl>=0?'+':'')+f(c.lv_pnl)}</td><td>${mk(c.match_lv)}</td>
     <td class="sep ${sc(c.com_side)}">${c.com_side||'—'}</td><td>${f(c.com_entry)}</td><td>${f(c.com_delta,1)}</td><td>${mk(c.match_com)}</td></tr>`;
    prevW=c.window;
   }
