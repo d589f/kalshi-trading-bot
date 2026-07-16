@@ -235,6 +235,7 @@ pub(crate) struct GateSnapshot {
     pub day_pnl: f64,
     pub daily_loss_stop: f64,
     pub entry: f64,
+    pub min_entry_price: f64,
     pub max_entry_price: f64,
     pub order_err: bool,
     pub status: u16,
@@ -255,7 +256,7 @@ pub(crate) fn classify_outcome(g: &GateSnapshot) -> Outcome {
     if g.day_pnl <= -g.daily_loss_stop {
         return Outcome::SkipLossStop;
     }
-    if !(0.50 < g.entry && g.entry <= g.max_entry_price) {
+    if !(g.min_entry_price < g.entry && g.entry <= g.max_entry_price) {
         return Outcome::SkipBand;
     }
     if g.order_err {
@@ -518,6 +519,10 @@ struct LiveCfg {
     daily_loss_stop: f64,
     max_count: i64,
     price_buf: f64,
+    /// LIVE-only lower entry-price band (default 0.50 = legacy). With max_entry it
+    /// forms the [min_entry, max_entry] window; a robust edge-filter sits at
+    /// [0.65, 0.75] (moderate favorites underpriced) — paper engine untouched.
+    min_entry: f64,
     /// on a no-fill, re-quote ONE deeper IOC at entry±requote_buf to catch a moved book.
     /// Applies only to the failed order (normal fills keep price_buf). 0 disables re-quote.
     requote_buf: f64,
@@ -658,6 +663,7 @@ async fn main() -> Result<()> {
         daily_loss_stop: env_f64("DAILY_LOSS_STOP", 30.0),
         max_count: env_i64("MAX_COUNT", 15),
         price_buf: env_f64("PRICE_BUF", 0.02),
+        min_entry: env_f64("MIN_ENTRY", 0.50).clamp(0.0, 0.98),
         requote_buf: env_f64("REQUOTE_BUF", 0.12),
         retry_max_attempts: env_i64("RETRY_MAX_ATTEMPTS", 2),
         retry_cooldown_secs: env_f64("RETRY_COOLDOWN_SECS", 3.0),
@@ -712,8 +718,8 @@ async fn main() -> Result<()> {
                 Ok(pem) => match Signer::from_pem(kid, &pem).and_then(|s| OrderClient::new(base.clone(), s, subaccount)) {
                     Ok(oc) => {
                         info!(
-                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${} subaccount={} exec_anchor={:?}",
-                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop, subaccount, exec_anchor
+                            "order client ready | LIVE_TRADING={} stake=${} max/day={} loss_stop=${} entry_band=({:.2},{:.2}] subaccount={} exec_anchor={:?}",
+                            lcfg.enabled, lcfg.stake, lcfg.max_trades_day, lcfg.daily_loss_stop, lcfg.min_entry, cfg.max_entry_price, subaccount, exec_anchor
                         );
                         Some(Arc::new(oc))
                     }
@@ -1575,8 +1581,8 @@ async fn place_live(
         ledger.append(&ctx(Outcome::SkipLossStop));
         return Outcome::SkipLossStop;
     }
-    if !(0.50 < entry && entry <= cfg.max_entry_price) {
-        warn!("LIVE SKIP: entry {:.2} out of (0.50, {:.2}]", entry, cfg.max_entry_price);
+    if !(lcfg.min_entry < entry && entry <= cfg.max_entry_price) {
+        warn!("LIVE SKIP: entry {:.2} out of ({:.2}, {:.2}]", entry, lcfg.min_entry, cfg.max_entry_price);
         ledger.append(&ctx(Outcome::SkipBand));
         return Outcome::SkipBand;
     }
@@ -1824,6 +1830,7 @@ mod tests {
             day_pnl: 0.0,
             daily_loss_stop: 50.0,
             entry: 0.70,
+            min_entry_price: 0.50,
             max_entry_price: 0.92,
             order_err: false,
             status: 201,
@@ -1856,6 +1863,17 @@ mod tests {
         let mut g = gate();
         g.entry = 0.40;
         assert_eq!(classify_outcome(&g), Outcome::SkipBand);
+        // MIN_ENTRY band: a raised lower bound rejects an otherwise-valid entry
+        // below it (the [0.65,0.75] edge-filter), and accepts one inside.
+        let mut g = gate();
+        g.min_entry_price = 0.65;
+        g.max_entry_price = 0.75;
+        g.entry = 0.60;
+        assert_eq!(classify_outcome(&g), Outcome::SkipBand, "0.60 below min 0.65 -> band");
+        g.entry = 0.70;
+        assert_eq!(classify_outcome(&g), Outcome::Filled, "0.70 inside [0.65,0.75] -> passes");
+        g.entry = 0.80;
+        assert_eq!(classify_outcome(&g), Outcome::SkipBand, "0.80 above max 0.75 -> band");
 
         let mut g = gate();
         g.order_err = true;
