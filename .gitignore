@@ -28,3 +28,6 @@ gcp_key*
 .env
 .env_*
 *secret*
+
+# Re-fetchable market history dumps (rebuild via kalshi_third/fetch_*.py)
+kalshi_third/*.csv
