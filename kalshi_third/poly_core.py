@@ -95,10 +95,14 @@ def buy_cost(w, side, sec, budget=5.0, horizon=45):
     return cost / got, got
 
 def pnl_poly(entry, won, stake=5.0):
-    """Zero-fee Polymarket PnL at $ stake."""
+    """Polymarket PnL at $ stake. CORRECTION 2026-07-15: Poly charges a taker fee
+    = 0.07·shares·p·(1-p) (same schedule as Kalshi, empirically identical over
+    221k real trades) — the earlier 'zero-fee' assumption was WRONG. Charged on
+    entry regardless of outcome."""
     if entry is None or entry <= 0.02 or entry >= 0.99: return None
     sh = stake / entry
-    return sh * (1 - entry) if won else -stake
+    fee = 0.07 * sh * entry * (1 - entry)
+    return (sh * (1 - entry) - fee) if won else (-stake - fee)
 
 if __name__ == "__main__":
     ws = load_windows()
