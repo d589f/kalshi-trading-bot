@@ -369,6 +369,21 @@ impl Dash {
                 o.retain(|_, val| !val.is_null());
             }
         }
+        // The table only renders the newest ~60 rows; every older row exists purely to
+        // feed the chart's cumulative sums. Shipping the full ~40-key object for all of
+        // them made the response big enough to outrun the page's 2s refresh, which
+        // stacked requests until the browser's per-host connection limit stalled the
+        // page. Older rows keep only the fields the chart actually reads.
+        const TABLE_ROWS: usize = 120;
+        const CHART_KEYS: [&str; 10] = [
+            "window", "pa_pnl", "pa_entry", "com_pnl", "com_entry", "com_won", "f1_pnl",
+            "f1_entry", "lv_pnl", "lv_entry",
+        ];
+        for v in out.iter_mut().skip(TABLE_ROWS) {
+            if let Some(o) = v.as_object_mut() {
+                o.retain(|k, _| CHART_KEYS.contains(&k.as_str()));
+            }
+        }
         out
     }
 
@@ -853,7 +868,12 @@ function updateChart(cmp){
   ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк сейчас $${curStake()}), таблица в реальных $)`
   :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк $${curStake()}), таблица в реальных $ · вся история — чекбокс FULL внизу)`;
 }
+let _loading=false;
 async function load(){
+ // The refresh timer fires every 2s but a full /stats round-trip can exceed that.
+ // Without this guard the requests stack until the browser's per-host connection
+ // limit is saturated and the page stops updating entirely.
+ if(_loading)return; _loading=true;
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
  // prefer the EU mirror's REAL binance.com signal; fall back to Buffalo's binance.US shadow
  const L=(d.live_com&&d.live_com.market)?d.live_com:d.live;
@@ -911,8 +931,12 @@ async function load(){
   document.getElementById('cmp').innerHTML=html;
  }
  }catch(e){document.getElementById('sub').textContent='fetch error: '+e}
+ finally{_loading=false}
 }
-load();setInterval(()=>{if(document.getElementById('auto').checked)load()},2000);
+// 5s, not 2s: /stats now carries a month of chart history, so polling faster than
+// the response takes just re-downloads the same payload continuously. The windows
+// this dashboard tracks are 15 minutes long — 5s is well inside "live".
+load();setInterval(()=>{if(document.getElementById('auto').checked)load()},5000);
 </script></body></html>"#;
 
 #[cfg(test)]
