@@ -359,6 +359,16 @@ impl Dash {
             .filter(|n| *n > 0)
             .unwrap_or(3000);
         out.truncate(cap);
+        // Each row carries ~40 keys but only the sources that fired in that window
+        // are ever set, so at this row count the null padding dominates the wire
+        // size. The client reads every one of these with `!= null`, which treats a
+        // missing key exactly like an explicit null, so dropping them is invisible
+        // to the page and roughly halves the payload.
+        for v in out.iter_mut() {
+            if let Some(o) = v.as_object_mut() {
+                o.retain(|_, val| !val.is_null());
+            }
+        }
         out
     }
 
