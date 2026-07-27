@@ -347,7 +347,18 @@ impl Dash {
                 })
             })
             .collect();
-        out.truncate(300); // full history for the chart cumulative; the table slices to recent rows
+        // Rows are newest-first, so this cap decides how far BACK the chart can reach.
+        // It must stay comfortably behind the newest deploy marker (the zero-view CUT),
+        // otherwise early windows silently fall off the tail and the "since update"
+        // totals SHRINK day by day even while the curve only rises. 300 rows was ~3
+        // days and had already slid past the CUT. 3000 ≈ 31 days of 15-min windows;
+        // override with DASH_ROWS when a marker gets older than that.
+        let cap: usize = std::env::var("DASH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(3000);
+        out.truncate(cap);
         out
     }
 
