@@ -658,7 +658,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=ptitle>┌─[ windows: <span style="color:#d6409f">paper F1</span> | <span style="color:#cf222e">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
- <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>pnl</th><th>=f1</th>
+ <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>pnl real$</th><th>=f1</th>
  <th class=sep>SHADOW</th><th>entry</th><th>Δ</th><th>=pa</th></tr></thead><tbody id=cmp></tbody></table>
 </div>
 <script src="/lwc.js"></script>
@@ -678,6 +678,13 @@ const UPDATES=[
 // нулевая точка zero-view БЕЗ визуального маркера (включение live 14.07 после пополнения):
 // участвует только в выборе среза CUT, в UPDATES не входит => ни стрелки, ни строки в таблице.
 const CHART_ZERO='2026-07-14T07:45';
+// Live stake changes. Only the CHART divides by these, to keep one continuous $5
+// scale across a stake step; the table/tooltip/cards always show the real money.
+// Add a row here (window-aligned, UTC minutes) whenever STAKE changes on the box.
+const STAKE_STEPS=[
+ {t:'2026-07-27T12:45', f:5},   // STAKE $5 -> $25 (MAX_COUNT 15 -> 40, loss stop $130)
+];
+const curStake=()=>{let f=1;for(const s of STAKE_STEPS)f=s.f;return 5*f;};
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
 const money=v=>(v>=0?'+$':'-$')+Math.abs(v||0).toFixed(2);
 const sc=s=>s=='YES'?'green':s=='NO'?'red':'dim';
@@ -816,6 +823,12 @@ function updateChart(cmp){
  //    разрыв LIVE-vs-pink = чистая экзекуция (slippage + no-fills + реальные fees).
  // NOTE: even at zero slippage LIVE needn't sit exactly on pink — twin5 models
  // round($5/e) cap 15 + modeled fee vs the ACTUAL filled count and actual fee.
+ // The live stake is not constant over history, so the CHART divides each fill by
+ // the stake in force at that window. Without this a stake step would put a jump
+ // in the curve that looks like performance but is only position size, and it
+ // would break comparability with the $5 twins. The TABLE, the tooltip and the
+ // cards keep the RAW real money — only this line is rescaled.
+ const lvScale=w=>{let f=1;for(const s of STAKE_STEPS){if(w>=s.t)f=s.f;}return f;};
  const lvSeries=[];{
   let f1c=0, anchor=full?null:0, lt=0, last=null;
   for(const r of rows){
@@ -825,7 +838,7 @@ function updateChart(cmp){
     if(r.f1_twin!=null) f1c+=r.f1_twin;
    }
    if(anchor!==null){
-    if(r.lv_pnl!=null) lt+=r.lv_pnl;
+    if(r.lv_pnl!=null) lt+=r.lv_pnl/lvScale(r.window);
     const v=+(anchor+lt).toFixed(2);
     if(ts!==last){lvSeries.push({time:ts,value:v});last=ts;}
     else if(lvSeries.length){lvSeries[lvSeries.length-1].value=v;}
@@ -837,8 +850,8 @@ function updateChart(cmp){
  const lvSum=rows.reduce((a,r)=>a+(r.lv_pnl||0),0);
  const f1rw=rows.filter(r=>r.f1_real!=null).length;
  document.getElementById('chartlbl').textContent=full
-  ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 real ${money(lvSum)}/${lvw}w, линия стартует от точки F1)`
-  :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE ${money(lvSum)}/${lvw}w · вся история — чекбокс FULL внизу)`;
+  ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк сейчас $${curStake()}), таблица в реальных $)`
+  :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк $${curStake()}), таблица в реальных $ · вся история — чекбокс FULL внизу)`;
 }
 async function load(){
  try{const r=await fetch('/stats');const d=await r.json();const S=d.summary;
