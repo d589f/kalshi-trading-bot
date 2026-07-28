@@ -1,7 +1,7 @@
 """WS-fed paper simulator: XO 5m + Poly 5m via live WebSocket books (sub-second),
 Kalshi 15m via signed REST (its WS needs auth+delta reconstruction = crash surface;
-sampled rarely). Same rule menu {mom, rev, fade, flatUP} on each venue, settle on
-binance. WS books cached + REST fallback on staleness. Heartbeat file for the
+sampled rarely). Same rule menu {mom, rev1, rev5, fade, flatUP} on each venue, settled by
+each venue's own resolution API. WS books cached + REST fallback on staleness. Heartbeat file for the
 watchdog. Every WS task / thread has its own try/reconnect so it never dies quietly.
   python3 -u xo_paper.py   -> /home/dmitrii/xo_paper/trades.csv  (+ .../heartbeat)"""
 import os, csv, json, time, base64, threading, asyncio, urllib.request, datetime as dt
@@ -28,9 +28,10 @@ COLS = ["t", "venue", "window", "rule", "side", "entry", "n", "outcome", "won", 
 XO_DEC, K_DEC = 60, 180
 MOM_THR = 50.0
 FADE_THR = 0.06
-REV_K = 5
+REV_K = 5                         # legacy lookback, kept so the two can be compared
+REV_KS = {"rev1": 1, "rev5": 5}   # rev1 = the lookback the 90d backtest actually favoured
 REV_THR = 0.001
-RULES = ["mom", "rev", "fade", "flatUP"]
+RULES = ["mom", "rev1", "rev5", "fade", "flatUP"]
 STALE = 5.0                       # seconds: WS cache older than this -> REST fallback
 
 def jget(u, hdr=None, to=6):
@@ -319,13 +320,26 @@ def poly_outcome(ep):
             except Exception: pass
     return None
 
-def kalshi_outcome(ticker):
-    p = "/trade-api/v2/markets/%s" % ticker
-    d = jget("https://api.elections.kalshi.com" + p, hdr=ksign(p), to=8)
-    m = (d or {}).get("market") or {}
-    res = str(m.get("result", "")).lower()
-    if res == "yes": return True
-    if res == "no": return False
+def kalshi_outcome(window_end):
+    """Resolve by the window's CLOSE TIME, never by a ticker captured earlier.
+
+    Kalshi does not list a window's market as `open` until ~25s into it, so the
+    "currently open" ticker read at window start still names the PREVIOUS window.
+    Settling against that ticker scores every trade with its neighbour's result,
+    which decorrelates outcome from entry price: the win rate stops tracking the
+    price paid, cheap-side rules mint profit on what is effectively a coin flip
+    and expensive-side rules bleed. Matching on close_time is exact and immune to
+    the listing lag."""
+    want = int(window_end)
+    for st in ("settled", "closed"):
+        p = "/trade-api/v2/markets?series_ticker=KXBTC15M&status=%s&limit=20" % st
+        d = jget("https://api.elections.kalshi.com" + p, hdr=ksign(p), to=8)
+        for m in (d or {}).get("markets", []) or []:
+            if abs(iso(m.get("close_time")) - want) > 30:
+                continue
+            res = str(m.get("result", "")).lower()
+            if res == "yes": return True
+            if res == "no": return False
     return None
 
 PENDING = []
@@ -383,8 +397,8 @@ def finalize(venue, win, buf, wlen, dec_sec, fee, wstart, outcome_up, src="venue
             if abs(disp) < MOM_THR:
                 log_trade(time.time(), venue, win, rule, "-", "", "", outcome, None, None, open_px, close_px, disp, fair, mid, "no-trigger"); continue
             side = "UP" if disp > 0 else "DOWN"; entry = dec["up_ask"] if side == "UP" else dec["dn_ask"]; note = "|d|=%.0f" % abs(disp)
-        elif rule == "rev":
-            p0 = px_at(wstart - REV_K * 60)
+        elif rule in REV_KS:
+            p0 = px_at(wstart - REV_KS[rule] * 60)
             if p0 is None or abs(open_px - p0) / p0 < REV_THR:
                 log_trade(time.time(), venue, win, rule, "-", "", "", outcome, None, None, open_px, close_px, disp, fair, mid, "no-trigger" if p0 else "no-hist"); continue
             side = "DOWN" if open_px > p0 else "UP"; entry = op["dn_ask"] if side == "DOWN" else op["up_ask"]; note = "trail=%+.2f%%" % (100 * (open_px - p0) / p0)
@@ -445,9 +459,11 @@ def paper_loop():
             wl = (s.get("window_minutes") or 15) * 60
             if ws_:
                 if k_win and k_win["s"] != ws_:
-                    queue_settle("KALSHI", k_win["id"], k_buf, k_win["wl"], K_DEC, kfee, k_win["s"], k_win.get("tk")); k_buf = []
+                    # settle by the window's own close time, not by whatever ticker
+                    # happened to be listed when it opened (see kalshi_outcome)
+                    queue_settle("KALSHI", k_win["id"], k_buf, k_win["wl"], K_DEC, kfee, k_win["s"], k_win["e"]); k_buf = []
                 if not k_win or k_win["s"] != ws_:
-                    k_win = {"s": ws_, "e": we_, "wl": wl, "id": time.strftime("%H%M", time.gmtime(ws_)), "tk": STATE.get("ktk")}
+                    k_win = {"s": ws_, "e": we_, "wl": wl, "id": time.strftime("%H%M", time.gmtime(ws_))}
                 if now - lastk > 2:
                     lastk = now
                     q = kalshi_quote()

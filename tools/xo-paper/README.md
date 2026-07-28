@@ -9,7 +9,7 @@ touches the production bot.
 
 | rule | decision point | signal | entry |
 |---|---|---|---|
-| `rev` | window open | trailing 5-min BTC move before the window, ≥0.1% → bet **against** it | open ask (~0.50) |
+| `rev1` / `rev5` | window open | trailing 1-min / 5-min BTC move before the window, ≥0.1% → bet **against** it. Two lookbacks because the 90d backtest favoured 1-min while the first live cut used 5-min | open ask (~0.50) |
 | `fade` | 60 s in | book mid deviates ≥0.06 from `Φ(displacement / σ√time_left)` → buy the under-priced side | decision ask |
 | `mom` | 60 s in (Kalshi 180 s) | \|displacement\| ≥ $50 → bet **with** the move (the live F1 analog) | decision ask |
 | `flatUP` | window open | none — always buy UP (drift control) | open ask |
