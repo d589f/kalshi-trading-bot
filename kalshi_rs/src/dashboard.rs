@@ -4,7 +4,9 @@
 //! Routes:
 //!   GET  /        → HTML page (auto-refreshing)
 //!   GET  /stats   → JSON {live, agg, compare[], paper_agg, triggers[]}
-//!   POST /paper   → ingest the prod paper f6 trades (a JSON array); pushed by a prod cron.
+//!   POST /paper   → ingest a regime-filtered paper series (JSON array), pushed by a prod cron.
+//!                   Was f6_wait270; now F1 gated on sigma<=30 $/min and entry<=0.75 - see
+//!                   tools/xo-paper/push_paper_f1sigma.py for why those two cuts.
 //!
 //! View: http://<server>:8890  (or SSH-tunnel: ssh -L 8890:localhost:8890 root@<server>)
 
@@ -78,7 +80,8 @@ pub struct TrigSummary {
     pub live: bool,
 }
 
-/// A paper f6 trade pushed from prod (`paper_compare_kalshi_15m`, session f6_wait270).
+/// A paper trade pushed from prod (`paper_compare_kalshi_15m`). Carries the regime-filtered
+/// F1 series since f6_wait270 was retired.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PaperTrade {
     #[serde(default)]
@@ -661,7 +664,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
  <div class=pane><div class=ptitle>┌─[ signal ]──────────</div><div id=live></div></div>
 </div>
 <div class=pane style="margin-bottom:9px">
-<div class=ptitle>┌─[ equity: <span class=yellow>paper f6</span> · <span style="color:#d6409f">paper F1 (сплошная=книга движка, пунктир=real)</span> · <span class=green>shadow f6</span> · <span style="color:#cf222e">LIVE F1 real (старт от точки F1)</span> ]───</div>
+<div class=ptitle>┌─[ equity: <span class=yellow>F1s (sigma<=30, entry<=0.75)</span> · <span style="color:#d6409f">paper F1 (сплошная=книга движка, пунктир=real)</span> · <span class=green>SHADOW F1</span> · <span style="color:#cf222e">LIVE F1 real (старт от точки F1)</span> ]───</div>
 <div id=chartwrap style="position:relative">
 <div id=chart style="width:100%;height:340px"></div>
 <div id=tip class=tip></div>
@@ -670,7 +673,7 @@ const HTML: &str = r#"<!doctype html><html><head><meta charset=utf-8>
 <div class=fbar><span><b>1</b><span class=fl>Hover=Info</span></span><span><b>5</b><span class=fl onclick=load()>Refresh</span></span><span><b>7</b><label class=fl>FULL история <input type=checkbox id=fullhist onchange="if(_cmp){updateChart(_cmp);if(_chart)_chart.timeScale().fitContent();}"></label></span><span><b>9</b><label class=fl>Auto2s <input type=checkbox id=auto checked></label></span><span><b>10</b><span class=fl>Kalshi-F1</span></span></div>
 </div>
 <div class=pane>
-<div class=ptitle>┌─[ windows: <span style="color:#d6409f">paper F1</span> | <span style="color:#cf222e">LIVE F1</span> | <span class=green>shadow f6</span> ]───</div>
+<div class=ptitle>┌─[ windows: <span style="color:#d6409f">paper F1</span> | <span style="color:#cf222e">LIVE F1</span> | <span class=green>SHADOW F1</span> ]───</div>
 <table><thead><tr><th class=l>window</th>
  <th class=sep>paper</th><th>entry</th><th>Δ</th><th>pnl</th>
  <th class=sep>LIVE</th><th>entry</th><th>Δ</th><th>pnl real$</th><th>=f1</th>
@@ -724,7 +727,7 @@ function initChart(){
  });
  const mk=(c,t,ls)=>_chart.addLineSeries({color:c,lineWidth:2,lineStyle:ls||0,title:t,priceLineVisible:false,lastValueVisible:true,
    priceFormat:{type:'custom',formatter:v=>(v>=0?'+$':'-$')+Math.abs(v).toFixed(0)}});
- _S.paper=mk('#e3a008','paper f6'); _S.com=mk('#2da44e','SHADOW f6'); _S.f1=mk('#d6409f','F1'); _S.f1r=mk('#d6409f','F1 real',2); _S.lv=mk('#cf222e','LIVE');
+ _S.paper=mk('#e3a008','F1-sigma'); _S.com=mk('#2da44e','SHADOW F1'); _S.f1=mk('#d6409f','F1'); _S.f1r=mk('#d6409f','F1 real',2); _S.lv=mk('#cf222e','LIVE');
  // zero baseline
  _S.paper.createPriceLine({price:0,color:'#cccccc',lineStyle:LightweightCharts.LineStyle.Dashed,lineWidth:1});
  new ResizeObserver(()=>_chart.applyOptions({width:el.clientWidth,height:340})).observe(el);
@@ -790,7 +793,7 @@ function renderTip(r){
  h+=tseg('📄 PAPER f6 $5-twin',r.pa_side,r.pa_entry,r.pa_delta,r.pa_p,ptw,r.pa_result,pnote);
  const mm=b=>b===true?'<span class=green>✓</span>':b===false?'<span class=red>✗</span>':'<span class=dim>—</span>';
  h+=`<div class=row style="margin-top:6px;border-top:1px solid #30363d;padding-top:5px"><span class=lbl>LIVE↔paper-F1</span><span>${mm(r.match_lv)}</span></div>`;
- h+=`<div class=row><span class=lbl>SHADOW↔paper f6</span><span>${mm(r.match_com)}</span></div>`;
+ h+=`<div class=row><span class=lbl>SHADOW↔paper F1</span><span>${mm(r.match_com)}</span></div>`;
  return h;
 }
 function updateChart(cmp){
@@ -865,8 +868,8 @@ function updateChart(cmp){
  const lvSum=rows.reduce((a,r)=>a+(r.lv_pnl||0),0);
  const f1rw=rows.filter(r=>r.f1_real!=null).length;
  document.getElementById('chartlbl').textContent=full
-  ?`(FULL история · paper/F1/shadow = uniform $5 twin · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк сейчас $${curStake()}), таблица в реальных $)`
-  :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · paper f6 ${money(tot('pa_twin'))}/${paw}w · shadow f6 ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк $${curStake()}), таблица в реальных $ · вся история — чекбокс FULL внизу)`;
+  ?`(FULL история · paper/F1/shadow = uniform $5 twin · F1s ${money(tot('pa_twin'))}/${paw}w · SHADOW ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} (книга движка) vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — по нашим реальным ценам) · LIVE F1 РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк сейчас $${curStake()}), таблица в реальных $)`
+  :`(с ${CUT.replace('T',' ')}Z — все линии от $0 · F1s ${money(tot('pa_twin'))}/${paw}w · SHADOW ${money(tot('com_twin'))}/${cow}w · paper F1 ${money(tot('f1_twin'))} vs F1 real ${money(tot('f1_real'))}/${f1rw}w (пунктир — наши реальные цены) · LIVE РЕАЛЬНЫЕ ${money(lvSum)}/${lvw}w — линия в $5-масштабе (стейк $${curStake()}), таблица в реальных $ · вся история — чекбокс FULL внизу)`;
 }
 let _loading=false;
 async function load(){
@@ -896,8 +899,8 @@ async function load(){
   +card('LIVE real · today',money(lc.day_pnl),rc(lc.day_pnl),true)
   +card('🔴 LIVE F1 (period, real $)',`${money(lvP)} · ${nLv}w · WR ${nLv?Math.round(100*wLv/nLv):0}%`,rc(lvP))
   +card('F1 $5-twin (period)',money(f1T),rc(f1T))
-  +card('shadow f6 twin (period)',`${money(shT)} · ${nSh}w`,rc(shT))
-  +card('paper f6 $5-twin (period)',money(pT),rc(pT))
+  +card('SHADOW F1 twin (period)',`${money(shT)} · ${nSh}w`,rc(shT))
+  +card('F1s $5-twin (эксперимент)',money(pT),rc(pT))
   +card('live = % of F1-twin (те же окна)',edge!=null?`${edge}%`:'—',edge==null?'dim':edge>=90?'green':edge>=70?'yellow':'red');
  document.getElementById('match').innerHTML=
    card('LIVE ↔ paper-F1 side-match',`${f(S.lv_pct,1)}%`,S.lv_pct>=90?'green':S.lv_pct>=70?'yellow':'red',true)
