@@ -701,6 +701,7 @@ const CHART_ZERO='2026-07-14T07:45';
 // Add a row here (window-aligned, UTC minutes) whenever STAKE changes on the box.
 const STAKE_STEPS=[
  {t:'2026-07-27T12:45', f:5},   // STAKE $5 -> $25 (MAX_COUNT 15 -> 40, loss stop $130)
+ {t:'2026-08-06T12:00', f:10},  // STAKE $25 -> $50 (MAX_COUNT 40 -> 80, loss stop $260)
 ];
 const curStake=()=>{let f=1;for(const s of STAKE_STEPS)f=s.f;return 5*f;};
 const f=(x,d=2)=>x==null?'—':(+x).toFixed(d);
